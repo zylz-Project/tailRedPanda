@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TailPanda 尾部运动可视化</title>
+<style>
+  :root { --bg: #1a1a2e; --panel: #16213e; --accent: #e94560; --text: #eee; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui; display:flex; height:100vh; overflow:hidden; }
+  .panel { width:320px; background:var(--panel); padding:20px; overflow-y:auto; display:flex; flex-direction:column; gap:14px; }
+  .panel h2 { margin:0 0 8px; font-size:18px; border-bottom:1px solid #333; padding-bottom:8px; }
+  label { font-size:12px; color:#aaa; display:block; margin-bottom:2px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .val { font-size:11px; color:#888; float:right; }
+  select { width:100%; padding:6px; background:#222; color:#fff; border:1px solid #444; border-radius:4px; }
+  button { padding:10px; border:none; border-radius:4px; cursor:pointer; font-size:13px; }
+  .btn-preset { background:#333; color:#fff; }
+  .btn-preset:hover { background:#444; }
+  .preset-row { display:flex; gap:6px; flex-wrap:wrap; }
+  .preset-row button { flex:1; min-width:70px; font-size:11px; padding:8px 4px; }
+  .info { font-size:11px; color:#888; line-height:1.5; }
+  .info b { color:#ddd; }
+  .main { flex:1; display:flex; flex-direction:column; }
+  canvas { flex:1; display:block; }
+  .legend { display:flex; gap:20px; padding:8px 16px; font-size:11px; color:#aaa; }
+  .legend span { display:flex; align-items:center; gap:4px; }
+  .legend .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <h2>🎯 TailPanda 尾部运动</h2>
+
+  <div>
+    <label>预设动作</label>
+    <div class="preset-row">
+      <button class="btn-preset" onclick="setPreset('breathe')">BREATHE</button>
+      <button class="btn-preset" onclick="setPreset('relax')">RELAX</button>
+      <button class="btn-preset" onclick="setPreset('circle')">CIRCLE</button>
+      <button class="btn-preset" onclick="setPreset('figure8')">FIGURE8</button>
+      <button class="btn-preset" onclick="setPreset('wave')">WAVE</button>
+      <button class="btn-preset" onclick="setPreset('wag')">WAG</button>
+    </div>
+    <div class="preset-row">
+      <button class="btn-preset" onclick="setPreset('raise_sway')" style="background:#2a4a2a">◆翘起晃</button>
+      <button class="btn-preset" onclick="setPreset('droop')" style="background:#2a4a2a">◆下垂晃</button>
+      <button class="btn-preset" onclick="setPreset('raise_hold')" style="background:#2a4a2a">◆定LR</button>
+      <button class="btn-preset" onclick="setPreset('slow_raise')" style="background:#2a4a2a">◆慢抬</button>
+      <button class="btn-preset" onclick="setPreset('alert')" style="background:#2a4a2a">◆直立</button>
+    </div>
+    <div class="preset-row">
+      <button class="btn-preset" onclick="setPreset('stiff1')" style="background:#522">❌斜线</button>
+      <button class="btn-preset" onclick="setPreset('stiff2')" style="background:#522">❌反斜</button>
+    </div>
+  </div>
+
+  <div>
+    <label>相位偏移 phase_offs <span class="val" id="v_phase">0.25</span></label>
+    <input type="range" id="phase" min="0" max="1" step="0.01" value="0.25" oninput="updateParam()">
+    <div class="info">
+      <b>0.0</b>=同步摆动 &nbsp; <b>0.25</b>=画圆 &nbsp; <b>0.5</b>=画8字
+    </div>
+  </div>
+
+  <div>
+    <label>LR 中心 lr_center <span class="val" id="v_lrc">90</span></label>
+    <input type="range" id="lrc" min="20" max="160" value="90" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>LR 振幅 lr_amp <span class="val" id="v_lra">55</span></label>
+    <input type="range" id="lra" min="0" max="90" value="55" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>UD 中心 ud_center <span class="val" id="v_udc">120</span></label>
+    <input type="range" id="udc" min="10" max="180" value="120" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>UD 振幅 ud_amp <span class="val" id="v_uda">45</span></label>
+    <input type="range" id="uda" min="0" max="90" value="45" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>周期 period (秒) <span class="val" id="v_period">5.0</span></label>
+    <input type="range" id="period" min="0.3" max="12" step="0.1" value="5.0" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>速度倍率 <span class="val" id="v_speed">1×</span></label>
+    <input type="range" id="speed" min="0.1" max="3" step="0.1" value="1" oninput="updateParam()">
+  </div>
+
+  <div>
+    <label>扭曲强度 warp <span class="val" id="v_warp">0.75</span></label>
+    <input type="range" id="warp" min="0" max="1" step="0.05" value="0.75" oninput="updateParam()">
+    <div class="info"><b>0</b>=纯正弦(机械匀速) &nbsp; <b>0.75</b>=肌肉感(极值停顿、过零快穿) &nbsp; <b>1</b>=全扭曲</div>
+  </div>
+
+  <canvas id="waveform" width="300" height="60" style="width:100%;border-radius:4px;background:#111;margin-top:4px;"></canvas>
+  <div class="info" style="text-align:center;">↑ 波形预览：橙色=扭曲后，灰色=纯正弦</div>
+
+  <div class="info" style="margin-top:8px;">
+    <b>坐标轴</b><br>
+    X 轴 = LR (左←0 … 90 … 180→右)<br>
+    Y 轴 = UD (上↑0 … 90 … 180↓下)<br>
+    <b>橙色点</b> = 当前位置 &nbsp; <b>绿色轨迹</b> = 运动路径
+  </div>
+</div>
+
+<div class="main">
+  <canvas id="c"></canvas>
+  <div class="legend">
+    <span><span class="dot" style="background:#f90"></span> 当前位置</span>
+    <span><span class="dot" style="background:#0f08"></span> 轨迹</span>
+    <span>← 左 &nbsp; 右 →</span>
+    <span>↑ 上 &nbsp; 下 ↓</span>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ★ = 椭圆生动, ◆ = 定住一方微微晃, ★★ = 画圆
+const presets = {
+  breathe:    {lrc:90,lra:55,udc:120,uda:45,period:5.0,phase:0.25,name:'BREATHE ★ 双轴椭圆'},
+  relax:      {lrc:90,lra:45,udc:130,uda:40,period:3.5,phase:0.22,name:'RELAX ★ 双轴椭圆'},
+  wag:        {lrc:90,lra:70,udc:180,uda:0,period:1.0,phase:0.0,name:'WAG — 纯LR摇'},
+  circle:     {lrc:90,lra:60,udc:90,uda:60,period:2.5,phase:0.25,name:'CIRCLE ★★ 画圆'},
+  figure8:    {lrc:90,lra:55,udc:90,uda:55,period:3.0,phase:0.28,name:'FIGURE8 ★★'},
+  wave:       {lrc:90,lra:60,udc:120,uda:45,period:4.0,phase:0.20,name:'WAVE ★ 椭圆'},
+  // "定住一方" 系列：一个轴大振幅，另一个轴微晃
+  raise_sway: {lrc:90,lra:35,udc:55,uda:6,period:4.0,phase:0.0,name:'RAISE_SWAY ◆ 翘起+左右晃'},
+  droop:      {lrc:90,lra:6,udc:172,uda:8,period:7.0,phase:0.0,name:'DROOP ◆ 下垂+微晃'},
+  raise_hold: {lrc:90,lra:5,udc:55,uda:25,period:6.0,phase:0.0,name:'RAISE_HOLD ◆ 定LR+UD微晃'},
+  slow_raise: {lrc:90,lra:6,udc:90,uda:55,period:12.0,phase:0.0,name:'SLOW_RAISE ◆ 定LR+UD慢抬'},
+  alert:      {lrc:90,lra:4,udc:35,uda:5,period:5.5,phase:0.0,name:'ALERT ◆ 直立定住+极微晃'},
+  // 对比
+  stiff1:     {lrc:90,lra:60,udc:120,uda:45,period:4.0,phase:0.0,name:'❌ 僵硬斜线 phase=0'},
+  stiff2:     {lrc:90,lra:60,udc:90,uda:60,period:3.0,phase:0.5,name:'❌ 反向斜线 phase=0.5'},
+};
+
+function setPreset(name) {
+  const p = presets[name];
+  document.getElementById('lrc').value = p.lrc;
+  document.getElementById('lra').value = p.lra;
+  document.getElementById('udc').value = p.udc;
+  document.getElementById('uda').value = p.uda;
+  document.getElementById('period').value = p.period;
+  document.getElementById('phase').value = p.phase;
+  document.getElementById('speed').value = 1;
+  updateParam();
+}
+
+// Phase warping: smoothstep — extremes are stretched, center is compressed
+function warpPhase(t, strength) {
+  const s = t * t * (3 - 2 * t);  // smoothstep
+  return t * (1 - strength) + s * strength;
+}
+
+function organicSin(x, warpStrength) {
+  const phase = ((x / (2 * Math.PI)) % 1 + 1) % 1;
+  const wx = warpPhase(phase, warpStrength) * 2 * Math.PI;
+  return Math.sin(wx)
+       + 0.12 * Math.sin(2 * wx + 0.5)
+       + 0.05 * Math.sin(3 * wx + 1.2);
+}
+
+function updateParam() {
+  document.getElementById('v_lrc').textContent = document.getElementById('lrc').value;
+  document.getElementById('v_lra').textContent = document.getElementById('lra').value;
+  document.getElementById('v_udc').textContent = document.getElementById('udc').value;
+  document.getElementById('v_uda').textContent = document.getElementById('uda').value;
+  document.getElementById('v_period').textContent = parseFloat(document.getElementById('period').value).toFixed(1);
+  document.getElementById('v_phase').textContent = parseFloat(document.getElementById('phase').value).toFixed(2);
+  document.getElementById('v_speed').textContent = parseFloat(document.getElementById('speed').value).toFixed(1)+'×';
+  document.getElementById('v_warp').textContent = parseFloat(document.getElementById('warp').value).toFixed(2);
+  drawWaveform();
+}
+
+function getParams() {
+  return {
+    lrc:    parseFloat(document.getElementById('lrc').value),
+    lra:    parseFloat(document.getElementById('lra').value),
+    udc:    parseFloat(document.getElementById('udc').value),
+    uda:    parseFloat(document.getElementById('uda').value),
+    period: parseFloat(document.getElementById('period').value),
+    phase:  parseFloat(document.getElementById('phase').value),
+    speed:  parseFloat(document.getElementById('speed').value),
+    warp:   parseFloat(document.getElementById('warp').value),
+  };
+}
+
+// Waveform preview
+function drawWaveform() {
+  const wc = document.getElementById('waveform');
+  const wctx = wc.getContext('2d');
+  const W = wc.width, H = wc.height;
+  const warpStr = parseFloat(document.getElementById('warp').value);
+  wctx.clearRect(0, 0, W, H);
+
+  // Grid
+  wctx.strokeStyle = '#222';
+  wctx.beginPath();
+  wctx.moveTo(0, H/2); wctx.lineTo(W, H/2);
+  wctx.stroke();
+
+  // Pure sine (gray)
+  wctx.strokeStyle = 'rgba(150,150,150,0.5)';
+  wctx.lineWidth = 1;
+  wctx.beginPath();
+  for (let i = 0; i <= W; i++) {
+    const x = (i / W) * Math.PI * 4;
+    const y = H/2 - Math.sin(x) * (H/2 - 4);
+    i === 0 ? wctx.moveTo(i, y) : wctx.lineTo(i, y);
+  }
+  wctx.stroke();
+
+  // Warped sine (orange)
+  wctx.strokeStyle = '#ff9900';
+  wctx.lineWidth = 2;
+  wctx.beginPath();
+  for (let i = 0; i <= W; i++) {
+    const x = (i / W) * Math.PI * 4;
+    const y = H/2 - organicSin(x, warpStr) * (H/2 - 4);
+    i === 0 ? wctx.moveTo(i, y) : wctx.lineTo(i, y);
+  }
+  wctx.stroke();
+
+  // Labels
+  wctx.fillStyle = '#888';
+  wctx.font = '9px system-ui';
+  wctx.fillText('纯正弦(匀速)', 4, 10);
+  wctx.fillText('扭曲后(肌肉感)', 4, H - 4);
+}
+
+// --- drawing ---
+const MARGIN = 50;
+const TRAIL_LEN = 400;  // trail points
+const trail = [];
+let t = 0;
+
+function resize() {
+  canvas.width = canvas.parentElement.clientWidth;
+  canvas.height = canvas.parentElement.clientHeight;
+}
+window.addEventListener('resize', resize);
+
+function mapX(lr) { return MARGIN + (lr/180) * (canvas.width - 2*MARGIN); }
+function mapY(ud) { return MARGIN + (ud/180) * (canvas.height - 2*MARGIN); }
+
+function draw() {
+  requestAnimationFrame(draw);
+
+  const p = getParams();
+  const dt = 0.016;  // ~60fps
+  t += dt * p.speed;
+
+  // calculate current position with phase-warped organic sine
+  const w = 2 * Math.PI / p.period;
+  const lr = p.lrc + p.lra * organicSin(w * t, p.warp);
+  const ud = p.udc + p.uda * organicSin(w * t + p.phase * 2 * Math.PI, p.warp);
+
+  trail.push({lr, ud});
+  if (trail.length > TRAIL_LEN) trail.shift();
+
+  if (canvas.width === 0) resize();
+
+  // --- draw ---
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 1;
+  for (let a = 0; a <= 180; a += 30) {
+    ctx.beginPath();
+    ctx.moveTo(mapX(a), MARGIN);
+    ctx.lineTo(mapX(a), canvas.height - MARGIN);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(MARGIN, mapY(a));
+    ctx.lineTo(canvas.width - MARGIN, mapY(a));
+    ctx.stroke();
+  }
+
+  // Center crosshair
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4,8]);
+  ctx.beginPath();
+  ctx.moveTo(mapX(90), MARGIN);
+  ctx.lineTo(mapX(90), canvas.height - MARGIN);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(MARGIN, mapY(90));
+  ctx.lineTo(canvas.width - MARGIN, mapY(90));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Axis labels
+  ctx.fillStyle = '#555';
+  ctx.font = '11px system-ui';
+  ctx.fillText('← 左 0°', MARGIN, MARGIN - 8);
+  ctx.fillText('180° 右 →', canvas.width - MARGIN - 45, MARGIN - 8);
+  ctx.fillText('↑ 上 0°', 4, MARGIN + 10);
+  ctx.fillText('↓ 下 180°', 4, canvas.height - MARGIN);
+  ctx.fillText('90°', mapX(90) - 10, MARGIN - 8);
+  ctx.fillText('90°', 4, mapY(90) + 4);
+
+  // Trail
+  if (trail.length > 1) {
+    for (let i = 1; i < trail.length; i++) {
+      const alpha = i / trail.length;
+      ctx.strokeStyle = `rgba(0,255,136,${alpha * 0.7})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(mapX(trail[i-1].lr), mapY(trail[i-1].ud));
+      ctx.lineTo(mapX(trail[i].lr), mapY(trail[i].ud));
+      ctx.stroke();
+    }
+  }
+
+  // Current position dot
+  const cx = mapX(lr), cy = mapY(ud);
+  ctx.fillStyle = '#ff9900';
+  ctx.shadowColor = '#ff9900';
+  ctx.shadowBlur = 12;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 6, 0, Math.PI*2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Current angle readout
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 13px system-ui';
+  const label = `LR=${lr.toFixed(0)}°  UD=${ud.toFixed(0)}°`;
+  const lw = ctx.measureText(label).width;
+  ctx.fillText(label, cx - lw/2, cy - 14);
+
+  // Phase label
+  ctx.fillStyle = '#888';
+  ctx.font = '12px system-ui';
+  const phaseLabel = `phase_offs=${p.phase.toFixed(2)}  period=${p.period.toFixed(1)}s`;
+  ctx.fillText(phaseLabel, canvas.width - MARGIN - ctx.measureText(phaseLabel).width, canvas.height - MARGIN + 16);
+}
+
+resize();
+updateParam();
+drawWaveform();
+draw();
+</script>
+</body>
+</html>
