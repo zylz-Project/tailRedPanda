@@ -1,6 +1,7 @@
 #include "config.h"
 #include "audio.h"
 #include "auto_run.h"
+#include "device_registry.h"
 #include "flash_audio.h"
 #include "http_server.h"
 #include "panda_samples.h"
@@ -38,6 +39,7 @@ extern "C" void app_main()
 
     // --- Sync ---
     if (online) {
+        device_registry_start();
         WiFiPowerSave(false);           // disable PS during download
         sync_audio_files();
         WiFiPowerSave(true);            // re-enable PS for battery life

@@ -255,3 +255,9 @@ tailPanda_1.0_wifi/
 6. **电池监测**：ADC 曲线拟合校准 + 32×过采样 + 指数移动平均
 7. **Flash 存储**：64MB W25Q512，TOC 索引支持 32 个 Opus 音频文件
 8. **手动优先**：网页手动控制舵机时自动暂停自运行动画
+
+## Audio Hub 设备绑定
+
+联网模式下，`main/device_registry.cc` 会使用 ESP32 出厂 MAC 生成唯一设备 ID。首次启动时向 Audio Hub 注册，并在串口输出六位激活码；管理员在服务端后台绑定后，设备把正式令牌保存到 NVS，并每 60 秒上报一次心跳。
+
+启用前将 `main/config.h` 的 `OFFLINE_DEMO` 改为 `0`，正确填写 Wi-Fi、`SYNC_SERVER_IP` 和 `SYNC_SERVER_PORT`。完整协议见服务端仓库的 `docs/DEVICE_ONBOARDING.md`。
