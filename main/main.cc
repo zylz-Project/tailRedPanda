@@ -40,9 +40,17 @@ extern "C" void app_main()
     // --- Sync ---
     if (online) {
         device_registry_start();
-        WiFiPowerSave(false);           // disable PS during download
-        sync_audio_files();
-        WiFiPowerSave(true);            // re-enable PS for battery life
+        ESP_LOGI(TAG, "等待设备在 Audio Hub 后台完成绑定…");
+        if (device_registry_wait_for_activation(portMAX_DELAY)) {
+            char api_token[DEVICE_API_TOKEN_SIZE] = {};
+            if (device_registry_get_api_token(api_token, sizeof(api_token))) {
+                WiFiPowerSave(false);           // disable PS during download
+                sync_audio_files(api_token);
+                WiFiPowerSave(true);            // re-enable PS for battery life
+            } else {
+                ESP_LOGE(TAG, "无法读取已验证的设备令牌，跳过同步");
+            }
+        }
     } else {
         ESP_LOGW(TAG, "Offline — using existing flash content");
     }

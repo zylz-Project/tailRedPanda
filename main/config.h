@@ -27,7 +27,7 @@
 // === Servo pins (3x 180° servos) ===
 // IO18: HEAD — 0°=turn right, 90°=center, 180°=turn left
 // IO15: TAIL left-right — 0°=leftmost, 90°=center, 180°=rightmost
-// IO16: TAIL up-down — 实际: 0°≈下, 90°≈中, 180°≈上 (与标注意见相反)
+// IO16: TAIL up-down — 0°=up, 90°=middle, 180°=down
 #define SERVO_POWER_GPIO GPIO_NUM_4
 #define SERVO_HEAD_GPIO GPIO_NUM_18
 #define SERVO_TAIL_LR_GPIO GPIO_NUM_15
@@ -57,19 +57,21 @@
 #define AUDIO_SILENT_INTERVAL_MIN_S 4
 #define AUDIO_SILENT_INTERVAL_MAX_S 6
 
-// === SPI Flash (W25Q256) ===
+// === External SPI Flash ===
+// 1 = W25Q256 (NOR, 64MB), 2 = W25N01GVZEIG (SPI NAND, 128MB)
+#define EXTERNAL_FLASH_TYPE 1
 #define SPI_FLASH_CS_PIN   GPIO_NUM_10
 #define SPI_FLASH_CLK_PIN  GPIO_NUM_9
 #define SPI_FLASH_MOSI_PIN GPIO_NUM_47
 #define SPI_FLASH_MISO_PIN GPIO_NUM_21
 
 // === WiFi Station ===
-#define WIFI_STA_SSID     "YOUR_WIFI_SSID"
-#define WIFI_STA_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_STA_SSID     "huachuang109"
+#define WIFI_STA_PASSWORD "huachuang109"
 #define WIFI_STA_TIMEOUT_S 15   // 连接超时(秒), 超时后继续运行
 
 // === Audio Sync Server ===
-#define SYNC_SERVER_IP    "192.168.1.100"  // 用户电脑 IP, 按需修改
+#define SYNC_SERVER_IP    "192.168.1.7"    // 用户电脑 IP, 按需修改
 #define SYNC_SERVER_PORT  5000
 #define SYNC_PRODUCT_ID   "tail-wagging-panda" // 产品标识, 用于服务端区分音频
 #define SYNC_DOWNLOAD_BUF_SIZE 4096        // 下载缓冲区大小

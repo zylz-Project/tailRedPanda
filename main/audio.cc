@@ -17,6 +17,7 @@
 #include <esp_audio_types.h>
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -29,6 +30,13 @@ static i2c_master_bus_handle_t i2c_bus_ = nullptr;
 static i2s_chan_handle_t tx_chan_ = nullptr;
 static QueueHandle_t sound_queue_ = nullptr;
 static volatile bool is_playing_ = false;
+static volatile float motion_level_ = 0.0f;
+static volatile float motion_attack_ = 0.0f;
+static volatile uint32_t motion_elapsed_ms_ = 0;
+static volatile uint32_t motion_duration_ms_ = 0;
+static volatile int motion_sound_index_ = -1;
+static float fast_envelope_ = 0.0f;
+static float slow_envelope_ = 0.0f;
 
 #define I2S_CHUNK_SAMPLES 240
 
@@ -43,6 +51,14 @@ static void AudioPlayTask(void *arg) {
     if (flash_audio_get_file_info(idx, &info) != ESP_OK) {
       continue;  // file was deleted (e.g. flash erased at runtime), skip silently
     }
+
+    motion_sound_index_ = idx;
+    motion_elapsed_ms_ = 0;
+    motion_duration_ms_ = info.duration_ms;
+    motion_level_ = 0.0f;
+    motion_attack_ = 0.0f;
+    fast_envelope_ = 0.0f;
+    slow_envelope_ = 0.0f;
 
     // PCM output buffer (60ms @ 48kHz mono = 2880 samples * 2 bytes = 5760 bytes)
     const uint32_t pcm_buf_sz = 48000 * 60 / 1000 * sizeof(int16_t);
@@ -99,6 +115,24 @@ static void AudioPlayTask(void *arg) {
       for (size_t off = 0; off < sn; off += I2S_CHUNK_SAMPLES) {
         size_t chunk_n = sn - off;
         if (chunk_n > I2S_CHUNK_SAMPLES) chunk_n = I2S_CHUNK_SAMPLES;
+
+        // A dual-time-constant envelope gives animation useful information
+        // without making the servos chase individual PCM samples.
+        const int16_t *samples = ((int16_t *)pcm) + off;
+        uint32_t absolute_sum = 0;
+        for (size_t i = 0; i < chunk_n; ++i)
+          absolute_sum += (uint32_t)std::abs((int)samples[i]);
+        float raw = chunk_n ? (float)absolute_sum / (float)chunk_n / 9000.0f : 0.0f;
+        if (raw > 1.0f) raw = 1.0f;
+        fast_envelope_ += (raw - fast_envelope_) * (raw > fast_envelope_ ? 0.48f : 0.12f);
+        slow_envelope_ += (raw - slow_envelope_) * 0.035f;
+        float onset = (fast_envelope_ - slow_envelope_ * 1.08f) * 3.2f;
+        if (onset < 0.0f) onset = 0.0f;
+        if (onset > 1.0f) onset = 1.0f;
+        motion_level_ = slow_envelope_;
+        motion_attack_ = onset;
+        motion_elapsed_ms_ += (uint32_t)(chunk_n * 1000U / 48000U);
+
         esp_codec_dev_write(dev_, ((int16_t *)pcm) + off, chunk_n * sizeof(int16_t));
         vTaskDelay(pdMS_TO_TICKS(3));
       }
@@ -126,6 +160,8 @@ static void AudioPlayTask(void *arg) {
     if (dec) esp_opus_dec_close(dec);
     heap_caps_free(pcm);
     is_playing_ = false;
+    motion_level_ = 0.0f;
+    motion_attack_ = 0.0f;
 
     if (!dec_fail) printf("I (%lu) %s: Done #%d: %d pkts, sr=%d\n",
                           (unsigned long)esp_log_timestamp(), TAG, idx, pkt_count, sr);
@@ -191,6 +227,16 @@ bool PlayPandaSound(int t) {
   return xQueueSend(sound_queue_, &t, 0) == pdTRUE;
 }
 bool IsAudioPlaying() { return is_playing_; }
+AudioMotionData GetAudioMotionData() {
+  AudioMotionData data = {};
+  data.playing = is_playing_;
+  data.level = motion_level_;
+  data.attack = motion_attack_;
+  data.elapsed_ms = motion_elapsed_ms_;
+  data.duration_ms = motion_duration_ms_;
+  data.sound_index = motion_sound_index_;
+  return data;
+}
 void FlushAudioQueue() {
   if (!sound_queue_) return;
   int dummy; while (xQueueReceive(sound_queue_, &dummy, 0) == pdTRUE) {}

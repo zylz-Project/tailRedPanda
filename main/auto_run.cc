@@ -2,603 +2,413 @@
 #include "audio.h"
 #include "config.h"
 #include "flash_audio.h"
-#include "panda_samples.h"
 #include "servo.h"
 
 #if ENABLE_AUTO_RUN
 
-#include <esp_log.h>
-#include <esp_random.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <esp_log.h>
+#include <esp_random.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-static const char *TAG = "tailpanda";
-
-// =========================================================================
-// 全局开关
-// =========================================================================
-static volatile bool g_running    = AUTO_RUN_DEFAULT_ON;
+static const char *TAG = "tailpanda_life";
+static volatile bool g_running = AUTO_RUN_DEFAULT_ON;
 static volatile bool g_hard_swing = AUTO_RUN_DEFAULT_HARD;
 
-bool IsAutoRunRunning()          { return g_running; }
-void SetAutoRunRunning(bool v)   { g_running = v; }
-bool IsAutoRunHardSwing()        { return g_hard_swing; }
-void SetAutoRunHardSwing(bool v) { g_hard_swing = v; }
+bool IsAutoRunRunning() { return g_running; }
+void SetAutoRunRunning(bool value) { g_running = value; }
+bool IsAutoRunHardSwing() { return g_hard_swing; }
+void SetAutoRunHardSwing(bool value) { g_hard_swing = value; }
 
-// =========================================================================
-// 工具函数
-// =========================================================================
-inline int irnd(int n) { return (int)(esp_random() % (uint32_t)(n)); }       // [0, n)
-inline int irand(int lo, int hi) { return lo + irnd(hi - lo + 1); }           // [lo, hi]
-inline float frnd() { return (float)esp_random() / (float)UINT32_MAX; }      // [0, 1)
-
-// 硬摆波形锐化：smoothstep 推极值
-inline float harden(float v) {
-    float s = fabsf(v);
-    s = s * s * (3.0f - 2.0f * s);
-    return (v > 0.0f ? s : -s);
+static int irnd(int count) { return count > 0 ? (int)(esp_random() % (uint32_t)count) : 0; }
+static int irand(int low, int high) { return low + irnd(high - low + 1); }
+static float frand(float low, float high) {
+  return low + ((float)esp_random() / (float)UINT32_MAX) * (high - low);
+}
+static float smoothstep(float value) {
+  value = std::clamp(value, 0.0f, 1.0f);
+  return value * value * value * (value * (value * 6.0f - 15.0f) + 10.0f);
 }
 
-// 相位扭曲：让正弦波在极值处"停顿"更久、过零点快速穿过
-// 模拟真实肌肉的"快收缩、慢放松"特征，打破匀速机械感
-inline float warp_phase(float linear) {
-    // smoothstep 扭曲：极值处平缓、过零处陡峭
-    float s = linear * linear * (3.0f - 2.0f * linear);
-    return linear * 0.25f + s * 0.75f;  // 25%保留线性 + 75%smoothstep扭曲
-}
+// README/docs confirmed: head 0=right; tail LR 0=left; tail UD 0=up.
+struct Pose { float head, tail_lr, tail_ud; };
+struct Keyframe { uint16_t duration_ms; int16_t head, tail_lr, tail_ud; };
+struct Clip { const char *name; const Keyframe *frames; uint8_t count; bool mirrorable; };
+#define COUNT_OF(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
 
-// 有机正弦 v2：相位扭曲 + 谐波 = 不对称的"肌肉感"
-// 效果：动作在两端有微停顿（像呼吸），穿过中点时快速（像弹跳）
-inline float organic_sin(float x) {
-    float phase = fmodf(x / (2.0f * M_PI), 1.0f);
-    if (phase < 0.0f) phase += 1.0f;
-    float wx = warp_phase(phase) * 2.0f * M_PI;
-    return sinf(wx)
-         + 0.12f * sinf(2.0f * wx + 0.5f)
-         + 0.05f * sinf(3.0f * wx + 1.2f);
-}
+// One-shot performances: anticipation -> emotional peak -> soft return.
+static constexpr Keyframe kIdleGlance[] = {
+  {650,132,82,156},{420,145,82,156},{820,112,112,142},{950,90,90,150}};
+static constexpr Keyframe kIdleLowSweep[] = {
+  {850,78,32,170},{1150,108,154,154},{950,96,55,174},{900,90,90,152}};
+static constexpr Keyframe kIdlePerk[] = {
+  {700,118,95,148},{850,150,142,58},{520,136,156,44},{1100,96,104,126},{700,90,90,150}};
+static constexpr Keyframe kIdleCircle[] = {
+  {650,62,35,126},{650,75,76,58},{650,105,150,78},{650,125,158,144},
+  {650,102,78,170},{850,90,90,148}};
+static constexpr Keyframe kCuriousPeek[] = {
+  {380,142,90,158},{520,154,90,158},{700,148,138,92},{420,62,146,74},
+  {680,128,45,120},{950,90,90,148}};
+static constexpr Keyframe kCuriousTrack[] = {
+  {500,38,104,158},{820,54,150,132},{350,145,150,132},{760,132,45,72},{950,90,90,146}};
+static constexpr Keyframe kCuriousCircle[] = {
+  {450,150,92,158},{600,138,34,106},{600,92,70,42},{600,48,148,68},
+  {600,72,158,146},{900,90,90,150}};
+static constexpr Keyframe kEatSearch[] = {
+  {700,42,70,168},{520,128,38,174},{420,55,118,172},{420,138,150,165},
+  {600,72,62,174},{850,90,90,154}};
+static constexpr Keyframe kEatChew[] = {
+  {620,128,74,168},{360,56,76,168},{470,122,108,172},{330,68,110,172},
+  {620,145,148,158},{900,90,90,152}};
+static constexpr Keyframe kEatDelight[] = {
+  {650,45,42,174},{500,132,148,166},{650,55,154,138},{620,138,36,102},{850,90,90,150}};
+static constexpr Keyframe kBabySeek[] = {
+  {420,35,92,160},{360,145,92,160},{650,128,42,128},{520,52,148,86},
+  {750,135,122,52},{950,90,90,146}};
+static constexpr Keyframe kBabyWiggle[] = {
+  {500,138,48,145},{440,58,144,116},{500,126,32,82},{460,65,155,58},
+  {750,120,72,126},{900,90,90,150}};
+static constexpr Keyframe kBabyComfort[] = {
+  {800,138,128,142},{900,150,154,94},{1000,126,122,52},{1000,104,62,96},{950,90,90,148}};
+static constexpr Keyframe kProudDisplay[] = {
+  {650,45,88,158},{750,142,40,92},{900,155,84,28},{650,62,156,48},
+  {850,132,138,108},{1000,90,90,150}};
+static constexpr Keyframe kProudPatrol[] = {
+  {900,32,148,130},{900,148,34,98},{750,122,70,44},{750,52,152,66},{1000,90,90,148}};
+static constexpr Keyframe kProudCall[] = {
+  {500,118,90,154},{780,155,46,92},{900,148,90,24},{700,48,158,54},
+  {750,128,34,118},{1050,90,90,150}};
+static constexpr Keyframe kNuzzle[] = {
+  {800,142,118,152},{900,158,150,118},{850,146,128,70},{900,120,48,102},{1050,90,90,150}};
+static constexpr Keyframe kShyApproach[] = {
+  {650,38,76,164},{900,55,42,140},{620,142,138,96},{850,152,154,58},{1100,90,90,150}};
+static constexpr Keyframe kSoftCurl[] = {
+  {1000,128,36,154},{1100,145,58,92},{1200,132,122,46},{1000,108,156,108},{1050,90,90,150}};
+static constexpr Keyframe kPlayWag[] = {
+  {480,138,28,132},{480,55,154,112},{520,128,36,78},{520,62,158,54},
+  {620,145,42,98},{850,90,90,148}};
+static constexpr Keyframe kPlayChase[] = {
+  {550,42,150,154},{550,138,42,126},{600,52,30,76},{600,145,148,42},
+  {650,118,158,126},{900,90,90,150}};
+static constexpr Keyframe kPlayEight[] = {
+  {520,145,35,112},{520,72,78,48},{520,42,150,106},{520,128,105,164},
+  {520,152,38,104},{520,58,104,52},{520,36,154,116},{850,90,90,150}};
+static constexpr Keyframe kAmbientListen[] = {
+  {1100,42,90,166},{1500,55,132,138},{1200,145,142,84},{1800,132,62,56},{1600,90,90,146}};
+static constexpr Keyframe kAmbientRain[] = {
+  {1000,132,42,168},{800,48,148,154},{1300,120,154,106},{1400,62,84,48},
+  {1500,104,32,112},{1500,90,90,152}};
+static constexpr Keyframe kAmbientScent[] = {
+  {1300,35,54,170},{1500,62,148,158},{1300,142,128,116},{1500,118,38,72},{1600,90,90,150}};
+static constexpr Keyframe kAmbientStretch[] = {
+  {1500,122,90,174},{1800,145,42,116},{1800,132,82,34},{1700,55,154,68},{1800,90,90,150}};
+static constexpr Keyframe kSettle[] = {
+  {700,90,90,170},{1200,102,108,146},{850,90,90,150}};
 
-// =========================================================================
-// 运行时音效索引 —— 根据 Flash 中的 category 字段动态选择
-// =========================================================================
-static int g_last_sound = 0;
-
-static void init_sound_indices() {
-    int total = flash_audio_get_file_count();
-    int animal = flash_audio_get_count_by_category("animal");
-    int ambient = flash_audio_get_count_by_category("ambient");
-    ESP_LOGI(TAG, "Audio: %d total (🐾%d animal  🌿%d ambient)", total, animal, ambient);
-}
-
-static bool trigger_sound() {
-    int idx = flash_audio_get_random_in_category("animal");
-    if (idx < 0) return false;
-    g_last_sound = idx;
-    PlayPandaSound(idx);
-    return true;
-}
-
-// =========================================================================
-// 头部模式（12 种）—— center + amplitude × sin(2π·t/period)
-// =========================================================================
-enum HeadMode {
-    HEAD_BREATHE, HEAD_IDLE, HEAD_NOD, HEAD_TILT, HEAD_SHAKE,
-    HEAD_SWEEP, HEAD_LOOK_LEFT, HEAD_LOOK_RIGHT, HEAD_SLEEP,
-    HEAD_PECK, HEAD_SNUGGLE, HEAD_ALERT,
-    HEAD_MODE_COUNT
+enum ClipId {
+  C_IDLE_GLANCE,C_IDLE_LOW_SWEEP,C_IDLE_PERK,C_IDLE_CIRCLE,
+  C_CURIOUS_PEEK,C_CURIOUS_TRACK,C_CURIOUS_CIRCLE,
+  C_EAT_SEARCH,C_EAT_CHEW,C_EAT_DELIGHT,
+  C_BABY_SEEK,C_BABY_WIGGLE,C_BABY_COMFORT,
+  C_PROUD_DISPLAY,C_PROUD_PATROL,C_PROUD_CALL,
+  C_NUZZLE,C_SHY_APPROACH,C_SOFT_CURL,
+  C_PLAY_WAG,C_PLAY_CHASE,C_PLAY_EIGHT,
+  C_AMBIENT_LISTEN,C_AMBIENT_RAIN,C_AMBIENT_SCENT,C_AMBIENT_STRETCH,
+  C_SETTLE,C_COUNT
 };
-struct HParam { int center; int amplitude; float period_s; };
-// 大幅度 + 长周期 = 舒展舒缓，不追求小幅度
-static constexpr HParam kHeadP[HEAD_MODE_COUNT] = {
-    {90,25,7.0f}, {90,22,5.0f}, {90,40,3.5f}, {80,35,4.5f},  // BREATHE, IDLE, NOD, TILT
-    {90,40,3.0f}, {90,60,5.0f}, {130,12,6.0f}, {50,12,6.0f}, // SHAKE, SWEEP, LOOK_L, LOOK_R
-    {95, 8,8.0f}, {90,30,2.0f}, {90,22,3.5f}, {90,45,2.5f},  // SLEEP, PECK, SNUGGLE, ALERT
+static constexpr Clip kClips[C_COUNT] = {
+  {"idle_glance",kIdleGlance,COUNT_OF(kIdleGlance),true},
+  {"idle_low_sweep",kIdleLowSweep,COUNT_OF(kIdleLowSweep),true},
+  {"idle_perk",kIdlePerk,COUNT_OF(kIdlePerk),true},
+  {"idle_circle",kIdleCircle,COUNT_OF(kIdleCircle),true},
+  {"curious_peek",kCuriousPeek,COUNT_OF(kCuriousPeek),true},
+  {"curious_track",kCuriousTrack,COUNT_OF(kCuriousTrack),true},
+  {"curious_circle",kCuriousCircle,COUNT_OF(kCuriousCircle),true},
+  {"eat_search",kEatSearch,COUNT_OF(kEatSearch),true},
+  {"eat_chew",kEatChew,COUNT_OF(kEatChew),true},
+  {"eat_look_up",kEatDelight,COUNT_OF(kEatDelight),true},
+  {"baby_seek",kBabySeek,COUNT_OF(kBabySeek),true},
+  {"baby_wiggle",kBabyWiggle,COUNT_OF(kBabyWiggle),true},
+  {"baby_comfort",kBabyComfort,COUNT_OF(kBabyComfort),true},
+  {"proud_display",kProudDisplay,COUNT_OF(kProudDisplay),true},
+  {"proud_patrol",kProudPatrol,COUNT_OF(kProudPatrol),true},
+  {"proud_call",kProudCall,COUNT_OF(kProudCall),true},
+  {"affection_nuzzle",kNuzzle,COUNT_OF(kNuzzle),true},
+  {"affection_shy",kShyApproach,COUNT_OF(kShyApproach),true},
+  {"affection_curl",kSoftCurl,COUNT_OF(kSoftCurl),true},
+  {"playful_wag",kPlayWag,COUNT_OF(kPlayWag),true},
+  {"playful_chase",kPlayChase,COUNT_OF(kPlayChase),true},
+  {"playful_figure8",kPlayEight,COUNT_OF(kPlayEight),true},
+  {"ambient_listen",kAmbientListen,COUNT_OF(kAmbientListen),true},
+  {"ambient_rain",kAmbientRain,COUNT_OF(kAmbientRain),true},
+  {"ambient_scent",kAmbientScent,COUNT_OF(kAmbientScent),true},
+  {"ambient_stretch",kAmbientStretch,COUNT_OF(kAmbientStretch),true},
+  {"settle",kSettle,COUNT_OF(kSettle),false},
 };
 
-// =========================================================================
-// 尾部模式（19 种）—— IO15=LR (0左180右), IO16=UD (0上180下)
-// phase_offs: 0=同步, 0.25=画圆, 0.5=反向
-// =========================================================================
-enum TailMode {
-    TAIL_BREATHE, TAIL_RELAX, TAIL_WAG, TAIL_SWING_WIDE,
-    TAIL_CIRCLE, TAIL_FIGURE8, TAIL_RAISE_SWAY, TAIL_DROOP,
-    TAIL_WAVE, TAIL_FLICK, TAIL_TWITCH, TAIL_BOUNCE,
-    TAIL_RAISE_HOLD, TAIL_SLOW_RAISE,
-    TAIL_RAISE_WAG, TAIL_RAISE_CIRCLE, TAIL_RAISE_FIGURE8,
-    TAIL_ALERT, TAIL_HAPPY,
-    TAIL_BREATHE2,  // 呼吸变体
-    TAIL_MODE_COUNT
-};
-struct TParam { int lr_c, lr_a, ud_c, ud_a; float period_s, phase_offs; };
-// phase>0 → 椭圆轨迹；一轴大另一轴小的模式 = "定住一个方向轻轻晃"
-static constexpr TParam kTailP[TAIL_MODE_COUNT] = {
-    {90,55,120,45, 5.0f,0.25f}, {90,45,130,40, 3.5f,0.22f}, // BREATHE, RELAX
-    {90,70,180, 0, 1.0f,0.0f},  {90,65,120,45, 2.5f,0.18f}, // WAG(纯LR), SWING_WIDE
-    {90,60, 90,60, 2.5f,0.25f}, {90,55, 90,55, 3.0f,0.28f}, // CIRCLE, FIGURE8
-    {90,35, 55, 6, 4.0f,0.0f},  {90, 6,172, 8, 7.0f,0.0f}, // RAISE_SWAY(翘起+LR微晃), DROOP(下垂+UD微晃)
-    {90,60,120,45, 4.0f,0.20f}, {90,65,130,25, 1.8f,0.25f}, // WAVE, FLICK
-    {90,35,150,25, 1.5f,0.30f}, {90,50,120,40, 2.2f,0.20f}, // TWITCH, BOUNCE
-    {90, 5, 55,25, 6.0f,0.0f},  {90, 6, 90,55,12.0f,0.0f}, // RAISE_HOLD(LR定住+UD微晃), SLOW_RAISE(LR定住+UD慢抬)
-    {90,60, 60,35, 1.5f,0.20f}, {90,50, 80,45, 1.8f,0.25f}, // RAISE_WAG, RAISE_CIRCLE
-    {90,45, 80,40, 2.5f,0.25f}, {90, 4, 35, 5, 5.5f,0.0f}, // RAISE_FIGURE8, ALERT(直立定住+极微晃)
-    {90,45, 60,35, 1.0f,0.22f},                               // HAPPY
+enum Behaviour { B_IDLE,B_CURIOUS,B_EAT,B_BABY,B_PROUD,B_AFFECTION,B_PLAYFUL,B_AMBIENT,B_SETTLE,B_COUNT };
+static constexpr int8_t kFamily[B_COUNT][4] = {
+  {C_IDLE_GLANCE,C_IDLE_LOW_SWEEP,C_IDLE_PERK,C_IDLE_CIRCLE},
+  {C_CURIOUS_PEEK,C_CURIOUS_TRACK,C_CURIOUS_CIRCLE,-1},
+  {C_EAT_SEARCH,C_EAT_CHEW,C_EAT_DELIGHT,-1},
+  {C_BABY_SEEK,C_BABY_WIGGLE,C_BABY_COMFORT,-1},
+  {C_PROUD_DISPLAY,C_PROUD_PATROL,C_PROUD_CALL,-1},
+  {C_NUZZLE,C_SHY_APPROACH,C_SOFT_CURL,-1},
+  {C_PLAY_WAG,C_PLAY_CHASE,C_PLAY_EIGHT,-1},
+  {C_AMBIENT_LISTEN,C_AMBIENT_RAIN,C_AMBIENT_SCENT,C_AMBIENT_STRETCH},
+  {C_SETTLE,-1,-1,-1},
 };
 
-// =========================================================================
-// 音效 → 动作映射
-// =========================================================================
-static void sound_to_action(int sound, HeadMode &h, TailMode &t,
-                             float &ha, float &ta, bool &hd) {
-    int r = irnd(100);
-    switch (sound) {
-    case 1: case 2: // 熊猫叫声
-        if (r < 30)      { h = HEAD_LOOK_LEFT;  t = TAIL_WAG;        ha = 0.80f; ta = 0.85f; hd = false; }
-        else if (r < 55) { h = HEAD_LOOK_RIGHT; t = TAIL_RAISE_HOLD; ha = 0.80f; ta = 0.80f; hd = false; }
-        else if (r < 75) { h = HEAD_TILT;       t = TAIL_FLICK;      ha = 0.75f; ta = 0.90f; hd = true; }
-        else             { h = HEAD_SWEEP;       t = TAIL_RAISE_WAG;  ha = 0.85f; ta = 0.80f; hd = false; }
-        break;
-    case 3: // 吃竹子
-        if (r < 40)      { h = HEAD_PECK;    t = TAIL_RELAX;  ha = 0.95f; ta = 0.60f; hd = false; }
-        else if (r < 70) { h = HEAD_NOD;     t = TAIL_TWITCH; ha = 0.80f; ta = 0.50f; hd = false; }
-        else             { h = HEAD_SNUGGLE;  t = TAIL_BOUNCE; ha = 0.75f; ta = 0.70f; hd = false; }
-        break;
-    case 4: // 宝宝嘤嘤
-        if (r < 50)      { h = HEAD_SHAKE;  t = TAIL_WAG;        ha = 0.90f; ta = 1.00f; hd = (r < 20); }
-        else if (r < 80) { h = HEAD_NOD;    t = TAIL_BOUNCE;     ha = 0.85f; ta = 0.90f; hd = false; }
-        else             { h = HEAD_ALERT;  t = TAIL_RAISE_HOLD; ha = 0.80f; ta = 0.85f; hd = true; }
-        break;
-    case 5: // 成年叫声
-        if (r < 35)      { h = HEAD_SWEEP;      t = TAIL_SWING_WIDE; ha = 0.90f; ta = 0.85f; hd = (r < 15); }
-        else if (r < 65) { h = HEAD_ALERT;      t = TAIL_RAISE_HOLD; ha = 0.95f; ta = 0.90f; hd = true; }
-        else             { h = HEAD_LOOK_LEFT;  t = TAIL_RAISE_WAG;  ha = 0.85f; ta = 0.80f; hd = false; }
-        break;
-    case 6: // 撒娇
-        if (r < 35)      { h = HEAD_TILT;    t = TAIL_CIRCLE;        ha = 0.80f; ta = 0.75f; hd = false; }
-        else if (r < 60) { h = HEAD_SNUGGLE; t = TAIL_FIGURE8;       ha = 0.75f; ta = 0.70f; hd = false; }
-        else             { h = HEAD_NOD;     t = TAIL_RAISE_FIGURE8; ha = 0.70f; ta = 0.65f; hd = false; }
-        break;
-    case 7: // 类似猫叫
-        if (r < 50)      { h = HEAD_TILT;    t = TAIL_CIRCLE;      ha = 0.85f; ta = 0.90f; hd = false; }
-        else             { h = HEAD_SNUGGLE;  t = TAIL_RAISE_HOLD; ha = 0.75f; ta = 0.80f; hd = false; }
-        break;
-    case 8: // 类似熊猫声
-        if (r < 40)      { h = HEAD_SHAKE;  t = TAIL_FIGURE8; ha = 0.90f; ta = 0.85f; hd = (r < 15); }
-        else if (r < 70) { h = HEAD_ALERT;  t = TAIL_BOUNCE;  ha = 0.85f; ta = 0.80f; hd = true; }
-        else             { h = HEAD_PECK;   t = TAIL_TWITCH;  ha = 0.70f; ta = 0.65f; hd = false; }
-        break;
-    default:
-        h = HEAD_IDLE; t = TAIL_RELAX; ha = 0.80f; ta = 0.80f; hd = false; break;
+struct ShuffleBag { int8_t items[4] = {-1,-1,-1,-1}; uint8_t count=0, position=0; };
+static ShuffleBag g_bags[B_COUNT];
+static int g_last_clip = -1;
+static int choose_clip(Behaviour behaviour) {
+  ShuffleBag &bag = g_bags[behaviour];
+  if (bag.position >= bag.count) {
+    bag.count = 0;
+    for (int i=0; i<4 && kFamily[behaviour][i]>=0; ++i) bag.items[bag.count++] = kFamily[behaviour][i];
+    for (int i=bag.count-1; i>0; --i) std::swap(bag.items[i], bag.items[irnd(i+1)]);
+    if (bag.count>1 && bag.items[0]==g_last_clip) std::swap(bag.items[0],bag.items[1]);
+    bag.position = 0;
+  }
+  int result = bag.items[bag.position++];
+  g_last_clip = result;
+  return result;
+}
+
+struct Player {
+  Pose pose={90,90,150};
+  const Clip *clip=nullptr;
+  uint8_t frame=0;
+  uint32_t frame_started_ms=0, frame_duration_ms=1;
+  float tempo=1;
+  bool mirror=false, active=false;
+};
+static Player g_player;
+static int g_mirror_balance = 0;
+
+static Pose lerp_pose(Pose a, Pose b, float t) {
+  Pose r;
+  r.head=a.head+(b.head-a.head)*t;
+  r.tail_lr=a.tail_lr+(b.tail_lr-a.tail_lr)*t;
+  r.tail_ud=a.tail_ud+(b.tail_ud-a.tail_ud)*t;
+  return r;
+}
+static Pose target_pose(const Clip &clip, uint8_t frame, bool mirror) {
+  const Keyframe &key=clip.frames[frame];
+  Pose pose={(float)key.head,(float)key.tail_lr,(float)key.tail_ud};
+  if (mirror && clip.mirrorable) { pose.head=180-pose.head; pose.tail_lr=180-pose.tail_lr; }
+  return pose;
+}
+// 连续目标流: 帧进度的最后 30% 提前滑向下一帧 → 动作连续流动、永不停顿
+static Pose flow_target(const Clip &clip, uint8_t frame, float progress, bool mirror) {
+  uint8_t next=std::min<uint8_t>(frame+1,clip.count-1);
+  Pose cur=target_pose(clip,frame,mirror);
+  Pose nxt=target_pose(clip,next,mirror);
+  float lead=std::clamp((progress-0.70f)/0.30f,0.0f,1.0f);
+  return lerp_pose(cur,nxt,smoothstep(lead));
+}
+static void start_clip(int clip_id, uint32_t now_ms) {
+  const Clip &clip=kClips[clip_id];
+  g_player.clip=&clip; g_player.frame=0;
+  g_player.frame_started_ms=now_ms;
+  g_player.tempo=g_hard_swing ? frand(0.76f,0.90f) : frand(0.88f,1.14f);
+  g_player.frame_duration_ms=std::max<uint32_t>(180,(uint32_t)(clip.frames[0].duration_ms*g_player.tempo));
+  if (!clip.mirrorable) {
+    g_player.mirror=false;
+  } else {
+    // Do not allow random mirroring to create a visible long-term side bias.
+    if (g_mirror_balance>=2) g_player.mirror=false;
+    else if (g_mirror_balance<=-2) g_player.mirror=true;
+    else g_player.mirror=irnd(2);
+    g_mirror_balance += g_player.mirror ? 1 : -1;
+  }
+  g_player.active=true;
+  ESP_LOGI(TAG,"clip=%s mirror=%d tempo=%.2f",clip.name,g_player.mirror,(double)g_player.tempo);
+}
+// 指数追踪: 姿态持续逼近目标流,自然缓入缓出,软着陆无硬停
+static void chase_pose(Pose target, uint32_t tau_ms) {
+  float k=1.0f-expf(-20.0f/(float)tau_ms);
+  g_player.pose.head+=(target.head-g_player.pose.head)*k;
+  g_player.pose.tail_lr+=(target.tail_lr-g_player.pose.tail_lr)*k;
+  g_player.pose.tail_ud+=(target.tail_ud-g_player.pose.tail_ud)*k;
+}
+static Pose update_player(uint32_t now_ms) {
+  if (!g_player.clip) return g_player.pose;
+  while (g_player.active && now_ms-g_player.frame_started_ms>=g_player.frame_duration_ms) {
+    g_player.frame_started_ms+=g_player.frame_duration_ms;
+    if (++g_player.frame>=g_player.clip->count) { g_player.active=false; break; }
+    g_player.frame_duration_ms=std::max<uint32_t>(180,(uint32_t)(g_player.clip->frames[g_player.frame].duration_ms*g_player.tempo));
+  }
+  uint8_t frame=std::min<uint8_t>(g_player.frame,g_player.clip->count-1);
+  float progress=std::clamp((float)(now_ms-g_player.frame_started_ms)/(float)g_player.frame_duration_ms,0.0f,1.0f);
+  Pose target=flow_target(*g_player.clip,frame,progress,g_player.mirror);
+  // tau 与帧时长联动: 快速动作跟得紧,慢速动作更慵懒
+  uint32_t tau=std::max<uint32_t>(70,g_player.frame_duration_ms/3);
+  chase_pose(target,tau);
+  return g_player.pose;
+}
+
+// ===== 常驻微动层: 让动物时刻"活着" =====
+static float g_breath_phase=0; static uint32_t g_breath_period=3400;
+static void add_breath(Pose &pose, float amount) {
+  g_breath_phase+=20.0f;
+  if (g_breath_phase>g_breath_period) { g_breath_phase=0; g_breath_period=(uint32_t)irand(2800,4300); }
+  float b=sinf(6.2831853f*g_breath_phase/(float)g_breath_period);
+  pose.head+=b*0.7f*amount;          // 呼吸带动头部微幅起伏
+  pose.tail_ud-=b*1.4f*amount;       // 尾巴随之轻轻浮沉
+}
+static float g_gaze_pos=0,g_gaze_target=0; static uint32_t g_gaze_next_ms=0;
+static void add_gaze(Pose &pose,uint32_t now_ms,float amount) {
+  if (now_ms>=g_gaze_next_ms) {
+    g_gaze_target=frand(-9.0f,9.0f);
+    g_gaze_next_ms=now_ms+(uint32_t)irand(1200,3800);
+  }
+  g_gaze_pos+=(g_gaze_target-g_gaze_pos)*0.03f;
+  pose.head+=g_gaze_pos*amount;      // 头部漫无目的地漂移凝视
+}
+static void add_tail_sway(Pose &pose,uint32_t now_ms,float amount) {
+  float t=(float)now_ms*0.001f;
+  pose.tail_lr+=(sinf(t*1.7f)+sinf(t*0.9f+1.3f)*0.7f)*1.1f*amount;
+  pose.tail_ud+=sinf(t*2.1f+0.7f)*0.5f*amount;
+}
+static float g_tremor_phase=0;
+static void add_tremor(Pose &pose,float amount) {
+  g_tremor_phase+=0.9f;
+  pose.head+=(sinf(g_tremor_phase*3.1f)+sinf(g_tremor_phase*5.7f+2.0f))*0.15f*amount;
+  pose.tail_lr+=(sinf(g_tremor_phase*4.3f+1.1f)+sinf(g_tremor_phase*2.3f))*0.12f*amount;
+  pose.tail_ud+=sinf(g_tremor_phase*3.7f+0.4f)*0.12f*amount;
+}
+
+static bool contains(const char *text,const char *needle) { return text && needle && strstr(text,needle); }
+static Behaviour classify_sound(int index) {
+  const char *name=flash_audio_get_name(index); int duration=flash_audio_get_duration_ms(index);
+  if (contains(name,"吃竹")||contains(name,"咀嚼")||contains(name,"eat")||contains(name,"chew")) return B_EAT;
+  if (contains(name,"宝宝")||contains(name,"嘤嘤")||contains(name,"baby")) return B_BABY;
+  if (contains(name,"撒娇")||contains(name,"亲近")||contains(name,"Cat")||contains(name,"cat")) return B_AFFECTION;
+  if (contains(name,"成年")||contains(name,"威风")||contains(name,"adult")) return B_PROUD;
+  if (duration>6500) return B_PROUD;
+  if (duration>0 && duration<1700) return B_CURIOUS;
+  return irnd(100)<55 ? B_CURIOUS : B_PLAYFUL;
+}
+static bool queue_random_sound(const char *category) {
+  int index=flash_audio_get_random_in_category(category);
+  if (index<0 || !PlayPandaSound(index)) return false;
+  ESP_LOGI(TAG,"queued #%d %s [%s]",index,flash_audio_get_name(index),category); return true;
+}
+
+static Pose apply_audio_motion(Pose pose,const AudioMotionData &audio,uint32_t now_ms) {
+  static uint32_t last_ms=now_ms,last_onset_ms=0;
+  static uint32_t tail_due_ms=0;
+  static float onset_offset=0,tail_onset_offset=0,pending_tail_offset=0,tail_phase=0;
+  static int onset_side=1;
+  uint32_t elapsed=now_ms-last_ms; last_ms=now_ms;
+  if (!audio.playing) {
+    onset_offset*=0.88f; tail_onset_offset*=0.94f; tail_due_ms=0;
+    return pose;
+  }
+  if (audio.attack>0.16f && now_ms-last_onset_ms>320) {
+    onset_side=-onset_side;
+    onset_offset=onset_side*(5+10*audio.attack);
+    pending_tail_offset=-onset_side*(5+8*audio.attack);
+    tail_due_ms=now_ms+(uint32_t)irand(160,320);
+    last_onset_ms=now_ms;
+  }
+  if (tail_due_ms && now_ms>=tail_due_ms) {
+    tail_onset_offset=pending_tail_offset;
+    tail_due_ms=0;
+  }
+  onset_offset*=0.90f; tail_onset_offset*=0.955f;
+  tail_phase+=(float)elapsed*(0.00055f+0.00125f*audio.level);
+  pose.head+=onset_offset;
+  pose.tail_lr+=tail_onset_offset+sinf(tail_phase)*std::min(14.0f,audio.level*24.0f);
+  pose.tail_ud-=std::min(11.0f,audio.level*18.0f);
+  return pose;
+}
+static void output_pose(Pose pose) {
+  int head=(int)std::lround(std::clamp(pose.head,8.0f,172.0f));
+  int lr=(int)std::lround(std::clamp(pose.tail_lr,6.0f,174.0f));
+  int ud=(int)std::lround(std::clamp(pose.tail_ud,10.0f,178.0f));
+  SetServoAngle(SERVO_HEAD,head); SetServoAngle(SERVO_TAIL_LR,lr); SetServoAngle(SERVO_TAIL_UD,ud);
+}
+
+static void auto_run_task(void *) {
+  constexpr uint32_t FRAME_MS=20;
+  int animal_count=flash_audio_get_count_by_category("animal");
+  int ambient_count=flash_audio_get_count_by_category("ambient");
+  ESP_LOGI(TAG,"living motion v3: animal=%d ambient=%d",animal_count,ambient_count);
+  uint32_t now_ms=esp_log_timestamp(),next_sound_ms=now_ms+8000;
+  uint32_t next_ambient_ms=now_ms+300000,next_idle_ms=now_ms+1800;
+  uint32_t clip_finished_ms=0;
+  bool was_playing=false; Behaviour sound_behaviour=B_CURIOUS;
+  start_clip(C_SETTLE,now_ms);
+  while (true) {
+    now_ms=esp_log_timestamp();
+    if (!g_running) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+    AudioMotionData audio=GetAudioMotionData(); bool playing=audio.playing;
+    bool clip_was_active=g_player.active;
+    if (playing && !was_playing) {
+      const char *category=flash_audio_get_category(audio.sound_index);
+      sound_behaviour=strcmp(category,"ambient")==0 ? B_AMBIENT : classify_sound(audio.sound_index);
+      start_clip(choose_clip(sound_behaviour),now_ms);
+      ESP_LOGI(TAG,"audio start #%d %s -> behaviour %d",audio.sound_index,flash_audio_get_name(audio.sound_index),sound_behaviour);
     }
-}
-
-// =========================================================================
-// 模式选择池
-// =========================================================================
-// 舒缓模式头部：只保留最温柔的动作，NOD 在自然音下也显得突兀
-static constexpr HeadMode kRelaxH[] = {
-    HEAD_BREATHE, HEAD_IDLE, HEAD_TILT, HEAD_SLEEP, HEAD_SNUGGLE
-};
-static constexpr int kRelaxHN = sizeof(kRelaxH) / sizeof(kRelaxH[0]);
-
-// 舒缓模式尾部：只保留最慢最柔的动作，<=1.5s 周期的全部去掉
-static constexpr TailMode kRelaxT[] = {
-    TAIL_BREATHE, TAIL_RELAX, TAIL_DROOP,
-    TAIL_RAISE_HOLD, TAIL_SLOW_RAISE, TAIL_ALERT,
-    TAIL_WAVE
-};
-static constexpr int kRelaxTN = sizeof(kRelaxT) / sizeof(kRelaxT[0]);
-
-// Idle 头部池：去掉 SHAKE/PECK，整体偏温柔
-static constexpr HeadMode kIdleH[] = {
-    HEAD_BREATHE, HEAD_IDLE, HEAD_TILT, HEAD_NOD, HEAD_SNUGGLE,
-    HEAD_SLEEP, HEAD_LOOK_LEFT, HEAD_LOOK_RIGHT
-};
-static constexpr int kIdleHN = sizeof(kIdleH) / sizeof(kIdleH[0]);
-
-// Idle 尾部池：去掉 WAG/SWING_WIDE/FLICK/TWITCH/BOUNCE，保留温和动作
-static constexpr TailMode kIdleT[] = {
-    TAIL_BREATHE, TAIL_BREATHE2, TAIL_RELAX, TAIL_DROOP,
-    TAIL_WAVE, TAIL_CIRCLE, TAIL_FIGURE8,
-    TAIL_RAISE_SWAY, TAIL_RAISE_HOLD, TAIL_SLOW_RAISE,
-    TAIL_RAISE_WAG, TAIL_RAISE_CIRCLE, TAIL_RAISE_FIGURE8,
-    TAIL_ALERT, TAIL_HAPPY
-};
-static constexpr int kIdleTN = sizeof(kIdleT) / sizeof(kIdleT[0]);
-
-// 暂停姿态池（动-停交替中的"停"阶段）
-static constexpr HeadMode kStillH[] = {
-    HEAD_SLEEP, HEAD_IDLE, HEAD_LOOK_LEFT, HEAD_LOOK_RIGHT
-};
-static constexpr int kStillHN = sizeof(kStillH) / sizeof(kStillH[0]);
-
-static constexpr TailMode kStillT[] = {
-    TAIL_DROOP, TAIL_DROOP, TAIL_DROOP,   // DROOP 权重 3x
-    TAIL_ALERT, TAIL_RAISE_HOLD
-};
-static constexpr int kStillTN = sizeof(kStillT) / sizeof(kStillT[0]);
-
-
-// =========================================================================
-// 动作渐变交叉结构
-// =========================================================================
-struct XFade {
-    bool     active     = false;
-    uint32_t start_tick = 0;
-    HeadMode from_head;
-    TailMode from_tail;
-    float    from_head_amp, from_tail_amp;
-};
-
-// =========================================================================
-// 头部角度计算（含交叉渐变），纯函数，无副作用
-// =========================================================================
-static int calc_head_angle(uint32_t tick, int tick_ms,
-                            HeadMode mode, float amp_eff,
-                            const XFade *xfade) {
-    auto &hp = kHeadP[mode];
-    float t_s = tick * tick_ms / 1000.0f;
-    float ph  = fmodf(t_s / hp.period_s, 1.0f);
-    float sv  = organic_sin(ph * 2.0f * M_PI);
-
-    if (!xfade || !xfade->active)
-        return hp.center + (int)(hp.amplitude * sv * amp_eff);
-
-    float bt = (tick - xfade->start_tick) * tick_ms / 1000.0f;
-    if (bt >= 3.0f) return hp.center + (int)(hp.amplitude * sv * amp_eff);
-
-    float mx  = bt * bt * (3.0f - 2.0f * bt);
-    auto &ohp = kHeadP[xfade->from_head];
-    float op  = fmodf(t_s / ohp.period_s, 1.0f);
-    int old_a = ohp.center + (int)(ohp.amplitude * organic_sin(op * 2.0f * M_PI) * xfade->from_head_amp);
-    int new_a = hp.center  + (int)(hp.amplitude * sv * amp_eff);
-    return old_a + (int)((new_a - old_a) * mx);
-}
-
-// =========================================================================
-// 尾部角度计算（含交叉渐变），纯函数
-// =========================================================================
-static void calc_tail_angles(uint32_t tick, int tick_ms,
-                              TailMode mode, float amp_eff,
-                              const XFade *xfade, bool hard,
-                              int &lr, int &ud) {
-    auto &tp = kTailP[mode];
-    float speed = g_hard_swing ? HARD_SWING_SPEED_X : 1.0f;
-    float t_s   = tick * tick_ms / 1000.0f / speed;
-    float plr   = fmodf(t_s / tp.period_s, 1.0f);
-    float pud   = fmodf(t_s / tp.period_s + tp.phase_offs, 1.0f);
-    float slr   = organic_sin(plr * 2.0f * M_PI);
-    float sud   = organic_sin(pud * 2.0f * M_PI);
-    if (hard) { slr = harden(slr); sud = harden(sud); }
-
-    // 中心点缓慢漂移：模拟动物重心微调，避免永远回到同一点
-    float drift_lr = 3.0f * sinf(t_s * 0.12f + 0.8f);    // ~52s 周期
-    float drift_ud = 2.5f * sinf(t_s * 0.09f + 2.1f);    // ~70s 周期
-
-    if (!xfade || !xfade->active) {
-        lr = tp.lr_c + (int)((tp.lr_a * slr + drift_lr) * amp_eff);
-        ud = tp.ud_c + (int)((tp.ud_a * sud + drift_ud) * amp_eff);
-        return;
+    if (!playing && was_playing) {
+      start_clip(choose_clip(B_SETTLE),now_ms);
+      next_sound_ms=now_ms+(uint32_t)irand(AUDIO_SILENT_INTERVAL_MIN_S*1000,AUDIO_SILENT_INTERVAL_MAX_S*1000);
+      next_idle_ms=now_ms+(uint32_t)irand(1800,4200);
     }
-
-    float bt = (tick - xfade->start_tick) * tick_ms / 1000.0f;
-    if (bt >= 3.0f) {
-        lr = tp.lr_c + (int)((tp.lr_a * slr + drift_lr) * amp_eff);
-        ud = tp.ud_c + (int)((tp.ud_a * sud + drift_ud) * amp_eff);
-        return;
+    was_playing=playing;
+    if (!g_player.active && clip_was_active) clip_finished_ms=now_ms;
+    if (!g_player.active) {
+      if (playing) start_clip(choose_clip(sound_behaviour),now_ms);
+      else if (now_ms>=next_idle_ms) {
+        start_clip(choose_clip(B_IDLE),now_ms); next_idle_ms=now_ms+(uint32_t)irand(4200,9000);
+      } else if (clip_finished_ms && now_ms-clip_finished_ms>1400) {
+        // 表演结束后短暂停留,微动层接管,再轻轻收尾
+        start_clip(choose_clip(B_SETTLE),now_ms); clip_finished_ms=0;
+        next_idle_ms=now_ms+(uint32_t)irand(1500,3200);
+      }
     }
-
-    float mx   = bt * bt * (3.0f - 2.0f * bt);
-    auto &otp  = kTailP[xfade->from_tail];
-    float oplr = fmodf(t_s / otp.period_s, 1.0f);
-    float opud = fmodf(t_s / otp.period_s + otp.phase_offs, 1.0f);
-    float oslr = organic_sin(oplr * 2.0f * M_PI), osud = organic_sin(opud * 2.0f * M_PI);
-    if (hard) { oslr = harden(oslr); osud = harden(osud); }
-
-    int olr = otp.lr_c + (int)(otp.lr_a * oslr * xfade->from_tail_amp);
-    int oud = otp.ud_c + (int)(otp.ud_a * osud * xfade->from_tail_amp);
-    int nlr = tp.lr_c  + (int)((tp.lr_a * slr + drift_lr) * amp_eff);
-    int nud = tp.ud_c  + (int)((tp.ud_a * sud + drift_ud) * amp_eff);
-    lr = olr + (int)((nlr - olr) * mx);
-    ud = oud + (int)((nud - oud) * mx);
-}
-
-// =========================================================================
-// 自然音频多频有机晃动（助眠风格）
-// =========================================================================
-static void apply_nature_wobble(uint32_t tick, int tick_ms,
-                                 int &lr, int &ud) {
-    float nt  = tick * tick_ms / 1000.0f;
-    // 自然音效：多频段有机晃动，大幅度但慢节奏
-    float w1  = sinf(nt * 0.17f)       * 24.0f;
-    float w2  = sinf(nt * 0.35f + 1.0f) * 16.0f;
-    float w1u = cosf(nt * 0.21f)       * 10.0f;
-    float w2u = sinf(nt * 0.43f + 0.7f) *  8.0f;
-    float wob_lr = w1 + w2 * 0.5f;
-    float wob_ud = w1u + w2u * 0.5f;
-    lr = (int)((float)lr * 0.35f + (90.0f  + wob_lr) * 0.65f);
-    ud = (int)((float)ud * 0.35f + (150.0f + wob_ud) * 0.65f);
-}
-
-// =========================================================================
-// AutoRun 任务主函数
-// =========================================================================
-static void auto_run_task(void *arg) {
-    constexpr int MS = 20;                       // 帧间隔 ms
-    constexpr int TICK_DECAY = 5000 / MS;        // 幅度衰减 5s (tick数) — 更慢更丝滑
-    constexpr int TICK_DEBOUNCE = 500 / MS;      // 开关防抖 500ms
-
-    init_sound_indices();                        // 初始化音效索引
-
-    uint32_t tick = 0;
-
-    // ---- 当前动作状态 ----
-    HeadMode head_mode = HEAD_BREATHE;
-    TailMode tail_mode = TAIL_RELAX;      // 中性起始姿态，避免上电尾巴上翘
-    float    head_amp = 0.60f, tail_amp = 0.55f;  // 初始幅度温和
-    bool     is_hard  = false;
-    uint32_t amp_start = 0;
-
-    // ---- 舒缓模式 ----
-    bool     in_relax = false, nature_on = false;
-    uint32_t next_relax = (uint32_t)(300 * 1000 / MS);  // first relax after ~5min
-    uint32_t next_var   = 0;
-
-    // ---- 音效触发 ----
-    uint32_t next_sound   = (uint32_t)(8 * 1000 / MS);
-    uint32_t react_end    = 0;
-    bool     was_playing  = false;
-
-    // ---- 其他定时器 ----
-    uint32_t next_spont = (uint32_t)(irand(15, 35) * 1000 / MS);
-    uint32_t next_idle  = (uint32_t)(irand(8, 15) * 1000 / MS);
-
-    // ---- 防抖 ----
-    uint32_t last_toggle = 0;
-    bool     prev_running = g_running;
-
-    // ---- 渐变结构 ----
-    XFade xfade;
-
-    // ======================== 主循环 ========================
-    while (true) {
-        if (!g_running) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
-
-        // ----- 舒缓模式定时 -----
-        if (!in_relax && tick >= next_relax) {
-            int nature_idx = flash_audio_get_random_in_category("ambient");
-            if (nature_idx >= 0) {
-                in_relax  = true;
-                nature_on = true;
-                FlushAudioQueue();
-                PlayPandaSound(nature_idx);
-                // 初始也用舒缓池随机挑，避免每次都是同一个动作
-                head_mode = kRelaxH[irnd(kRelaxHN)];
-                tail_mode = kRelaxT[irnd(kRelaxTN)];
-                head_amp  = 0.75f + frnd() * 0.25f;
-                tail_amp  = 0.70f + frnd() * 0.30f;
-                is_hard   = false;
-                amp_start = tick;
-                xfade.active = false;
-                next_var  = tick + (uint32_t)(irand(1500, 2500) / MS);  // 更快开始第一轮切换
-                ESP_LOGI(TAG, "Relax ON");
-            } else {
-                next_relax = tick + (uint32_t)(300 * 1000 / MS); // 无声时5分钟后再试
-            }
-        }
-
-        // ----- 音频状态机 -----
-        bool now_playing = IsAudioPlaying();
-
-        // 看门狗：播放超180s告警
-        {
-            static uint32_t ps = 0;
-            if (now_playing && !was_playing) ps = tick;
-            if (now_playing && (tick - ps) > (uint32_t)(180000 / MS))
-                ESP_LOGE(TAG, "Audio stuck >180s");
-        }
-
-        if (now_playing && !was_playing) {
-            if (nature_on) {
-                // 舒缓模式：换动作（先保存旧状态，再设新模式，crossfade 才能正确插值）
-                HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-                float old_ha = head_amp, old_ta = tail_amp;
-                head_mode = kRelaxH[irnd(kRelaxHN)];
-                tail_mode = kRelaxT[irnd(kRelaxTN)];
-                head_amp  = 0.75f + frnd() * 0.25f;  // 自然音效：大幅度 + 长周期 = 舒展
-                tail_amp  = 0.70f + frnd() * 0.30f;
-                is_hard   = false;
-                amp_start = tick;
-                xfade.active = true; xfade.start_tick = tick;
-                xfade.from_head = old_h; xfade.from_tail = old_t;
-                xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-                next_var  = tick + (uint32_t)(irand(3, 6) * 1000 / MS);  // 换动作更快，增加多样性
-                if (irnd(5) == 0) next_var = tick + (uint32_t)(2000 / MS);
-            } else {
-                // 叫声音效联动（此处顺序正确：先捕获旧值再覆盖）
-                HeadMode h; TailMode t; float ha, ta; bool hd;
-                sound_to_action(g_last_sound, h, t, ha, ta, hd);
-                xfade.from_head = head_mode; xfade.from_tail = tail_mode;
-                xfade.from_head_amp = head_amp; xfade.from_tail_amp = tail_amp;
-                xfade.active = true; xfade.start_tick = tick;
-                head_mode = h; tail_mode = t;
-                head_amp = ha; tail_amp = ta; is_hard = hd;
-                amp_start = tick;
-                react_end = tick + (uint32_t)((4000 + irnd(3000)) / MS);
-            }
-        }
-        if (!now_playing && was_playing && nature_on) {
-            nature_on = false; in_relax = false;
-            next_relax = tick + (uint32_t)(irand(300, 600) * 1000 / MS);  // 5~10min
-            ESP_LOGI(TAG, "Relax OFF");
-            // 回idle：先保存旧状态再设新模式
-            HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-            float old_ha = head_amp, old_ta = tail_amp;
-            head_mode = kIdleH[irnd(kIdleHN)];
-            tail_mode = kIdleT[irnd(kIdleTN)];
-            head_amp  = 0.65f + frnd() * 0.25f;
-            tail_amp  = 0.60f + frnd() * 0.25f;
-            is_hard   = false;
-            amp_start = tick;
-            xfade.active = true; xfade.start_tick = tick;
-            xfade.from_head = old_h; xfade.from_tail = old_t;
-            xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-        }
-
-        was_playing = now_playing;
-
-        // ----- 联动结束回idle -----
-        if (!nature_on && !now_playing && react_end > 0 && tick >= react_end) {
-            HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-            float old_ha = head_amp, old_ta = tail_amp;
-            head_mode = kIdleH[irnd(kIdleHN)];
-            tail_mode = kIdleT[irnd(kIdleTN)];
-            head_amp  = 0.65f + frnd() * 0.25f;
-            tail_amp  = 0.60f + frnd() * 0.25f;
-            is_hard   = false;
-            amp_start = tick;
-            xfade.active = true; xfade.start_tick = tick;
-            xfade.from_head = old_h; xfade.from_tail = old_t;
-            xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-            react_end = 0;
-        }
-
-        // ----- 舒缓模式动作轮换 -----
-        if (nature_on && now_playing && tick >= next_var) {
-            HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-            float old_ha = head_amp, old_ta = tail_amp;
-            head_mode = kRelaxH[irnd(kRelaxHN)];
-            tail_mode = kRelaxT[irnd(kRelaxTN)];
-            head_amp  = 0.75f + frnd() * 0.25f;
-            tail_amp  = 0.70f + frnd() * 0.30f;
-            is_hard   = false;
-            amp_start = tick;
-            xfade.active = true; xfade.start_tick = tick;
-            xfade.from_head = old_h; xfade.from_tail = old_t;
-            xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-            next_var  = tick + (uint32_t)(irand(3, 6) * 1000 / MS);
-            if (irnd(5) == 0) next_var = tick + (uint32_t)(2000 / MS);
-        }
-
-        // ----- 自发微动作 -----
-        if (!in_relax && !now_playing && react_end == 0 && tick >= next_spont) {
-            if (irnd(5) == 0) {
-                HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-                float old_ha = head_amp, old_ta = tail_amp;
-                tail_mode = irnd(2) ? TAIL_WAVE : TAIL_BREATHE2;  // 用温柔动作替代 FLICK/TWITCH
-                head_amp  = 0.60f; tail_amp = 0.50f;
-                is_hard   = false;
-                amp_start = tick;
-                xfade.active = true; xfade.start_tick = tick;
-                xfade.from_head = old_h; xfade.from_tail = old_t;
-                xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-                react_end = tick + (uint32_t)(1200 / MS);
-            }
-            next_spont = tick + (uint32_t)(irand(15, 35) * 1000 / MS);
-        }
-
-        // ----- 周期性idle轮换 -----
-        if (!in_relax && !now_playing && react_end == 0 && tick >= next_idle) {
-            HeadMode old_h = head_mode; TailMode old_t = tail_mode;
-            float old_ha = head_amp, old_ta = tail_amp;
-            head_mode = kIdleH[irnd(kIdleHN)];
-            tail_mode = kIdleT[irnd(kIdleTN)];
-            head_amp  = 0.65f + frnd() * 0.25f;
-            tail_amp  = 0.60f + frnd() * 0.25f;
-            is_hard   = false;
-            amp_start = tick;
-            xfade.active = true; xfade.start_tick = tick;
-            xfade.from_head = old_h; xfade.from_tail = old_t;
-            xfade.from_head_amp = old_ha; xfade.from_tail_amp = old_ta;
-            next_idle = tick + (uint32_t)(irand(10, 20) * 1000 / MS);
-        }
-
-        // ----- 音效触发 -----
-        if (!in_relax && !now_playing && tick >= next_sound) {
-            trigger_sound();
-            next_sound = tick + (uint32_t)(1000 / MS); // 失败也1s后重试
-        }
-        if (now_playing) {
-            next_sound  = tick + (uint32_t)(irand(AUDIO_SILENT_INTERVAL_MIN_S,
-                                                   AUDIO_SILENT_INTERVAL_MAX_S) * 1000 / MS);
-            next_spont  = tick + (uint32_t)(irand(15, 35) * 1000 / MS);
-            next_idle   = tick + (uint32_t)(irand(8, 15) * 1000 / MS);
-        }
-
-        // ----- 防抖 -----
-        if (g_running != prev_running) {
-            if (tick - last_toggle < TICK_DEBOUNCE)
-                g_running = prev_running;
-            else {
-                last_toggle = tick;
-                prev_running = g_running;
-            }
-        }
-
-        // ----- 幅度衰减：5秒线性至75%（比之前的60%更温和）-----
-        float decay = 1.0f;
-        {
-            uint32_t dt = tick - amp_start;
-            if (dt < TICK_DECAY)
-                decay = 1.0f - (float)dt / (float)TICK_DECAY * 0.25f;
-            else
-                decay = 0.75f;
-        }
-        float ha = head_amp * decay;
-        float ta = tail_amp * decay;
-
-        // ----- 检查渐变是否过期 -----
-        if (xfade.active && (tick - xfade.start_tick) * MS / 1000 >= 3.0f)
-            xfade.active = false;
-
-        // ----- 计算角度并输出 -----
-        int h_ang = calc_head_angle(tick, MS, head_mode, ha,
-                                     xfade.active ? &xfade : nullptr);
-        SetServoAngle(SERVO_HEAD, h_ang);
-
-        int t_lr, t_ud;
-        calc_tail_angles(tick, MS, tail_mode, ta,
-                          xfade.active ? &xfade : nullptr, is_hard, t_lr, t_ud);
-
-        if (nature_on && now_playing)
-            apply_nature_wobble(tick, MS, t_lr, t_ud);
-
-        SetServoAngle(SERVO_TAIL_LR, t_lr);
-        SetServoAngle(SERVO_TAIL_UD, t_ud);
-
-        tick++;
-        vTaskDelay(pdMS_TO_TICKS(MS));
+    if (!playing && now_ms>=next_ambient_ms && ambient_count>0) {
+      if (queue_random_sound("ambient")) { next_ambient_ms=now_ms+(uint32_t)irand(480000,780000); next_sound_ms=now_ms+10000; }
+      else next_ambient_ms=now_ms+30000;
+    } else if (!playing && now_ms>=next_sound_ms && animal_count>0) {
+      next_sound_ms=now_ms+(queue_random_sound("animal") ? 10000 : 1000);
     }
+    Pose pose=update_player(now_ms);
+    // 常驻微动层: 呼吸 + 头部凝视漂移 + 尾巴轻摆 + 肌肉微颤
+    float life=playing ? 0.55f : 1.0f;
+    add_breath(pose,life);
+    add_gaze(pose,now_ms,life);
+    add_tail_sway(pose,now_ms,life);
+    add_tremor(pose,life);
+    pose=apply_audio_motion(pose,audio,now_ms);
+    output_pose(pose); vTaskDelay(pdMS_TO_TICKS(FRAME_MS));
+  }
 }
 
-// =========================================================================
-// HTTP
-// =========================================================================
 esp_err_t HandleAutoPlay(httpd_req_t *req) {
-    if (req->method == HTTP_POST) {
-        char buf[64] = {};
-        httpd_req_recv(req, buf, sizeof(buf) - 1);
-        const char *p = strstr(buf, "\"enable\":");
-        if (p) { p += 9; g_running = (atoi(p) != 0); }
-        else if (!strstr(buf, "hard_swing"))
-            g_running = !g_running;
-        p = strstr(buf, "\"hard_swing\":");
-        if (p) { p += 13; g_hard_swing = (strncmp(p, "true", 4) == 0 || atoi(p) == 1); }
-    }
-    char resp[96];
-    snprintf(resp, sizeof(resp), "{\"autoplay\":%s,\"hard_swing\":%s}",
-             g_running ? "true" : "false", g_hard_swing ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, resp);
-    return ESP_OK;
+  if (req->method==HTTP_POST) {
+    char buffer[64]={}; httpd_req_recv(req,buffer,sizeof(buffer)-1);
+    const char *value=strstr(buffer,"\"enable\":");
+    if (value) { value+=9; g_running=atoi(value)!=0; }
+    else if (!strstr(buffer,"hard_swing")) g_running=!g_running;
+    value=strstr(buffer,"\"hard_swing\":");
+    if (value) { value+=13; g_hard_swing=strncmp(value,"true",4)==0 || atoi(value)==1; }
+  }
+  char response[96];
+  snprintf(response,sizeof(response),"{\"autoplay\":%s,\"hard_swing\":%s}",g_running?"true":"false",g_hard_swing?"true":"false");
+  httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,response); return ESP_OK;
 }
-
 void InitAutoRun() {
-    xTaskCreate(auto_run_task, "auto_run", 4096, nullptr, 2, nullptr);
-    ESP_LOGI(TAG, "Auto-run task created");
+  xTaskCreate(auto_run_task,"auto_run",8192,nullptr,2,nullptr);
+  ESP_LOGI(TAG,"Living-motion auto-run task created");
 }
 
 #endif
