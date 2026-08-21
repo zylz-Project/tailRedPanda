@@ -1,6 +1,8 @@
 #include "power.h"
 #include "config.h"
+#include "audio.h"
 #include "chat.h"
+#include "servo.h"
 
 #include <driver/gpio.h>
 #include <esp_adc/adc_cali.h>
@@ -26,6 +28,45 @@ static int AdcToMv(int raw)
       return mv;
   }
   return raw * 3300 / 4096;
+}
+
+/* ============================================================================
+ * 电源键状态机 (参照 testBoard_wifiweb):
+ *   IDLE → 按下消抖 → PRESSED(长按计时) → 松开消抖 → IDLE
+ *   - 时间戳计时 (esp_log_timestamp), 不受调度抖动影响
+ *   - 长按达到阈值即关机(无需松开); 松开可取消
+ *   - 上电防误关机: 上电瞬间按键被按住时, 先释放一次才生效(armed)
+ *   - 短按释放: 双击(400ms内)切换对话
+ * ========================================================================== */
+#define POWER_PRESS_MV 1000  // <1V = 按下 (与参考一致, 用电压判定)
+typedef enum {
+    BTN_IDLE = 0,
+    BTN_DEBOUNCE_PRESS,
+    BTN_PRESSED,
+    BTN_DEBOUNCE_RELEASE,
+} power_btn_state_t;
+
+static void PowerShutdown()
+{
+    ESP_LOGW(TAG, "长按 %dms, 执行关机序列...", POWER_LONG_PRESS_MS);
+
+    /* 0. 关机提示音 (合成下扬叮咚) */
+    AudioPlayChime(false);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* 1. 舵机回中 + 断开舵机电源 */
+    SetServoAngle(SERVO_HEAD, SERVO_HEAD_DEFAULT_ANGLE);
+    SetServoAngle(SERVO_TAIL_LR, SERVO_TAIL_LR_DEFAULT_ANGLE);
+    SetServoAngle(SERVO_TAIL_UD, SERVO_TAIL_UD_DEFAULT_ANGLE);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(SERVO_POWER_GPIO, 0);
+    ESP_LOGI(TAG, "舵机电源 IO%d -> LOW", SERVO_POWER_GPIO);
+
+    /* 2. 切断电源自锁 */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(POWER_CTRL_GPIO, 0);
+    ESP_LOGW(TAG, "POWER_CTRL IO%d -> LOW, 系统即将断电", POWER_CTRL_GPIO);
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
 }
 
 void InitPower()
@@ -74,75 +115,100 @@ void InitPower()
     adc_cali_create_scheme_curve_fitting(&cali, &adc_cali_handle_);
   }
 
-  // Power monitor task: symmetric hysteresis debounce + long-press shutdown + battery
+  // Power monitor task: 4-state machine + long-press shutdown + double-click + battery
   xTaskCreate([](void *)
               {
-    vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for stabilization
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Wait for stabilization
 
-    // Symmetric hysteresis debounce state
-    int pwr_stable = 1;       // Debounced state: 1=released, 0=pressed
-    int pwr_debounce = 5;     // Debounce counter
-    uint32_t pwr_hold_ms = 0; // Pressed duration
+    power_btn_state_t st = BTN_IDLE;
+    uint32_t st_since = 0;   // 进入当前状态的时刻 (ms)
+    uint32_t press_start = 0; // 确认按下时刻 (ms)
+    bool     armed = false;   // 上电防误关机: 释放一次后生效
+    bool     boot_hold_logged = false;
+    uint32_t last_click_ms = 0;
+    uint32_t click_count = 0;
     uint32_t tick = 0;
-
-    const int debounce_max = POWER_DEBOUNCE_MS / POWER_POLL_MS;
 
     while (true) {
         tick++;
-
-        // --- Read power button ADC ---
         int raw = 0;
         adc_oneshot_read(adc_handle_, ADC_CHANNEL_5, &raw);
-        int raw_high = (raw > POWER_ADC_THRESHOLD) ? 1 : 0;  // >1241=released
+        bool pressed = (AdcToMv(raw) < POWER_PRESS_MV);
+        uint32_t now = esp_log_timestamp();
 
-        // Symmetric hysteresis debounce
-        if (raw_high == pwr_stable) {
-            if (pwr_debounce < debounce_max) pwr_debounce++;
-        } else {
-            if (pwr_debounce > 0) pwr_debounce--;
-            else { pwr_stable = raw_high; pwr_debounce = 1; }
-        }
+        switch (st) {
+        case BTN_IDLE:
+            if (pressed) {
+                st = BTN_DEBOUNCE_PRESS;
+                st_since = now;
+            } else if (!armed) {
+                /* 上电后第一次确认释放 → 武装长按关机 */
+                armed = true;
+                boot_hold_logged = false;
+                ESP_LOGI(TAG, "电源键已释放, 长按关机功能生效");
+            }
+            break;
 
-        // Edge detection
-        static int prev_stable = 1;
-        static uint32_t last_click_tick = 0;
-        static uint32_t click_count = 0;
-        if (pwr_stable != prev_stable) {
-            if (!pwr_stable) {
-                ESP_LOGI(TAG, "Power button PRESSED");
-                pwr_hold_ms = 0;
-            } else {
-                ESP_LOGI(TAG, "Power button RELEASED (held %dms)", (int)pwr_hold_ms);
-                // Shutdown on release if long-press threshold met
-                if (pwr_hold_ms >= POWER_LONG_PRESS_MS) {
-                    ESP_LOGW(TAG, "Long press %dms -> SHUTDOWN (IO%d -> LOW)",
-                             POWER_LONG_PRESS_MS, POWER_CTRL_GPIO);
-                    gpio_set_level(POWER_CTRL_GPIO, 0);
-                } else {
-                    // Short press -> double-click detection (toggles LLM chat)
-                    uint32_t now = xTaskGetTickCount();
-                    if (now - last_click_tick <= pdMS_TO_TICKS(400)) {
-                        click_count++;
-                    } else {
-                        click_count = 1;
+        case BTN_DEBOUNCE_PRESS:
+            if (!pressed) {
+                st = BTN_IDLE;  // 毛刺
+            } else if (now - st_since >= POWER_DEBOUNCE_MS) {
+                if (!armed) {
+                    /* 上电期间一直按着: 不进入长按, 等松开 */
+                    if (!boot_hold_logged) {
+                        boot_hold_logged = true;
+                        ESP_LOGI(TAG, "上电按住电源键, 长按忽略 (松开后生效)");
                     }
-                    last_click_tick = now;
+                    st = BTN_IDLE;
+                    break;
+                }
+                st = BTN_PRESSED;
+                press_start = now;
+                ESP_LOGI(TAG, "电源键按下确认");
+            }
+            break;
+
+        case BTN_PRESSED:
+            if (!pressed) {
+                st = BTN_DEBOUNCE_RELEASE;
+                st_since = now;
+            } else {
+                int hold = (int)(now - press_start);
+                if (hold >= POWER_LONG_PRESS_MS) {
+                    PowerShutdown();  // 长按到达 → 关机(无需松开)
+                }
+                /* 长按进度提示 (每 500ms) */
+                static int tip = 0;
+                int t = hold / 500;
+                if (t != tip && t > 0) { tip = t; ESP_LOGI(TAG, "长按中 %d.%d s (共需 %d s), 松开可取消", hold/1000, (hold%1000)/100, POWER_LONG_PRESS_MS/1000); }
+                if (hold / 500 == 0) tip = 0;
+            }
+            break;
+
+        case BTN_DEBOUNCE_RELEASE:
+            if (pressed) {
+                st = BTN_PRESSED;  // 没松干净
+            } else if (now - st_since >= POWER_DEBOUNCE_MS) {
+                int dur = press_start ? (int)(now - press_start) : 0;
+                ESP_LOGI(TAG, "电源键释放 (按住 %dms)", dur);
+                if (dur < POWER_LONG_PRESS_MS) {
+                    /* 短按 → 双击检测(切对话) */
+                    if (now - last_click_ms <= 400) click_count++;
+                    else click_count = 1;
+                    last_click_ms = now;
                     if (click_count >= 2) {
                         click_count = 0;
                         ESP_LOGI(TAG, "DOUBLE CLICK -> toggle chat");
                         ChatToggle();
                     }
                 }
+                st = BTN_IDLE;
+                press_start = 0;
             }
-            prev_stable = pwr_stable;
+            break;
         }
 
-        // Long-press timing only (shutdown happens on release above)
-        if (!pwr_stable) {
-            pwr_hold_ms += POWER_POLL_MS;
-        }
-
-        // --- Battery voltage (IO3) — every 5s ---
+        /* ---------- 电池电压 (IO3, 每 5s) ---------- */
         if (tick % BATTERY_READ_TICKS == 0) {
             int64_t bat_sum = 0;
             for (int n = 0; n < 32; n++) {
@@ -153,11 +219,8 @@ void InitPower()
             int bat_avg = static_cast<int>(bat_sum / 32);
             int vpin_mv = AdcToMv(bat_avg);
             int vbat_mv = static_cast<int>(vpin_mv * BATTERY_DIVIDER_RATIO);
-            if (battery_vbat_filtered_mv_ == 0) {
-                battery_vbat_filtered_mv_ = vbat_mv;
-            } else {
-                battery_vbat_filtered_mv_ += (vbat_mv - battery_vbat_filtered_mv_) / 5;
-            }
+            if (battery_vbat_filtered_mv_ == 0) battery_vbat_filtered_mv_ = vbat_mv;
+            else battery_vbat_filtered_mv_ += (vbat_mv - battery_vbat_filtered_mv_) / 5;
             int vbat_f = battery_vbat_filtered_mv_;
             battery_level_ = (vbat_f - BATTERY_EMPTY_VOLTAGE_MV) * 100 /
                              (BATTERY_FULL_VOLTAGE_MV - BATTERY_EMPTY_VOLTAGE_MV);
@@ -169,7 +232,7 @@ void InitPower()
 
         vTaskDelay(pdMS_TO_TICKS(POWER_POLL_MS));
     } }, "power_mon", 4096, nullptr, 1, nullptr);
-  ESP_LOGI(TAG, "Power monitor started (IO6 ADC, long press %dms, debounce %dms)",
+  ESP_LOGI(TAG, "Power monitor started (state machine, long press %dms, debounce %dms)",
            POWER_LONG_PRESS_MS, POWER_DEBOUNCE_MS);
 }
 

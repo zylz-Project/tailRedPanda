@@ -25,6 +25,7 @@ extern "C" void app_main()
     nvs_flash_init();
     InitPower();
     InitAudio();
+    AudioPlayChime(true);  // 开机提示音 (合成上扬叮咚)
     InitServos();
     ESP_LOGI(TAG, "heap free=%lu bytes after audio/servo (internal=%lu, psram=%lu)",
              (unsigned long)esp_get_free_heap_size(),
