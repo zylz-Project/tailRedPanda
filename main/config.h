@@ -6,6 +6,7 @@
 #define AUTO_RUN_DEFAULT_ON 1    // 1 = active on power-up, 0 = start paused
 #define AUTO_RUN_DEFAULT_HARD 0  // 1 = hard swing (instant to extrema + hold), 0 = sin² smooth
 #define HARD_SWING_SPEED_X 4.0f  // Hard-swing period multiplier (>1 = faster, 4x = continuous)
+#define CHAT_ENABLE 1            // 1 = compile LLM realtime chat (double-click power to toggle)
 
 // === Power management ===
 #define POWER_CTRL_GPIO GPIO_NUM_7   // Latch HIGH = power on, LOW = power off
@@ -53,12 +54,13 @@
 #define AUDIO_I2S_GPIO_DOUT GPIO_NUM_46
 #define AUDIO_I2S_GPIO_DIN GPIO_NUM_14
 #define AUDIO_SAMPLE_RATE 48000  // Opus source is 48kHz
-#define AUDIO_OUTPUT_VOLUME 80   // 0-100
+#define AUDIO_OUTPUT_VOLUME 95   // 0-100
 #define AUDIO_SILENT_INTERVAL_MIN_S 4
 #define AUDIO_SILENT_INTERVAL_MAX_S 6
 
 // === External SPI Flash ===
-// 1 = W25Q256 (NOR, 64MB), 2 = W25N01GVZEIG (SPI NAND, 128MB)
+// 1 = W25Q256 (NOR), 2 = W25N01GVZEIG (SPI NAND, 128MB)
+// 当前板子接的是 W25Q256 (NOR)
 #define EXTERNAL_FLASH_TYPE 1
 #define SPI_FLASH_CS_PIN   GPIO_NUM_10
 #define SPI_FLASH_CLK_PIN  GPIO_NUM_9
@@ -66,9 +68,11 @@
 #define SPI_FLASH_MISO_PIN GPIO_NUM_21
 
 // === WiFi Station ===
-#define WIFI_STA_SSID     "huachuang109"
-#define WIFI_STA_PASSWORD "huachuang109"
-#define WIFI_STA_TIMEOUT_S 15   // 连接超时(秒), 超时后继续运行
+// 默认 WiFi 信息已注释, 用于模拟"无 WiFi"场景测试配网热点。
+// 恢复后重新编译即可 (或通过 NVS 配网保存凭据)。
+//#define WIFI_STA_SSID     "huachuang109"
+//#define WIFI_STA_PASSWORD "huachuang109"
+#define WIFI_STA_TIMEOUT_S 8   // 连接超时(秒), 超时后继续运行
 
 // === Audio Sync Server ===
 #define SYNC_SERVER_IP    "192.168.1.7"    // 用户电脑 IP, 按需修改

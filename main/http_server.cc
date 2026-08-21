@@ -3,6 +3,9 @@
 #include "flash_upload_server.h"
 #include "power.h"
 #include "servo.h"
+#include "wifi.h"
+#include "wifi_config.h"
+#include "chat.h"
 #if ENABLE_AUTO_RUN
 #include "auto_run.h"
 #endif
@@ -59,6 +62,33 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
 <body>
 <h1>TailPanda</h1>
 <div class="status" id="status">就绪</div>
+
+<!-- WIFI -->
+<div class="card" id="wifiCard">
+<h2>WiFi</h2>
+<!-- 已连接: 只显示状态 + 重新配网 -->
+<div class="row" style="justify-content:space-between;display:none" id="wifiConnected">
+<span style="font-size:12px;color:#aaa" id="wifiInfo">--</span>
+<button type="button" class="btn btn-preset" onclick="enterPortal()">重新配网</button>
+</div>
+<!-- 未连接/配网: 显示完整表单 -->
+<div id="wifiForm">
+<div class="row" style="justify-content:space-between">
+<span style="font-size:12px;color:#aaa" id="wifiInfo2">--</span>
+</div>
+<button type="button" class="btn btn-preset" style="width:100%;margin-top:6px" onclick="scanWifi()">扫描附近 WiFi</button>
+<div id="wifiList" style="margin-top:6px;min-height:24px"></div>
+<div class="row" style="margin-top:6px">
+<div class="col" style="flex:1"><input id="wSsid" placeholder="WiFi SSID" style="width:100%"></div>
+</div>
+<div class="row">
+<div class="col" style="flex:1"><input id="wPass" placeholder="WiFi 密码" type="text" style="width:100%"></div>
+</div>
+<div class="row">
+<button type="button" class="btn btn-on" style="width:100%" onclick="saveWifi()">连接此 WiFi</button>
+</div>
+</div>
+</div>
 
 <!-- HEAD -->
 <div class="card grp-head">
@@ -362,6 +392,69 @@ async function doLookAround(){
   setStatus('就绪');
 }
 
+// --- WiFi ---
+function wifiShowForm(show){
+  $('wifiForm').style.display = show ? 'block' : 'none';
+  $('wifiConnected').style.display = show ? 'none' : 'flex';
+}
+async function updateWifiInfo(){
+  let r = await api('/api/wifi');
+  if(!r) return;
+  try{
+    let w = JSON.parse(r);
+    if(w.portal || !w.connected){
+      // 未连接/配网模式: 显示完整配网表单
+      $('wifiInfo2').textContent = w.portal ? '配网模式: 连接 Panda-XXXX → 192.168.4.1' : '未连接 WiFi, 请配置';
+      wifiShowForm(true);
+    } else {
+      // 已连接: 只显示状态 + 重新配网
+      $('wifiInfo').textContent = '已连接 ' + w.ssid + ' ' + w.ip;
+      wifiShowForm(false);
+    }
+  }catch(e){}
+}
+async function enterPortal(){
+  setStatus('正在进入配网模式...','#3498db');
+  await api('/api/wifi/portal', {});
+  setStatus('配网模式已开启：手机连接 Panda-XXXX 热点，访问 192.168.4.1', '#3498db');
+}
+async function scanWifi(){
+  setStatus('正在扫描附近 WiFi...','#4ecca3');
+  $('wifiList').innerHTML = '<div style="color:#888;font-size:12px;padding:4px">扫描中，请稍候...</div>';
+  let r = await api('/api/wifi/scan');
+  setStatus('扫描完成','#4ecca3');
+  if(!r){ $('wifiList').innerHTML='<div style="color:#e94560;font-size:12px">扫描失败，请重试</div>'; return; }
+  try{
+    let list = JSON.parse(r);
+    if(!list.length){ $('wifiList').innerHTML='<div style="color:#888;font-size:12px">未发现 WiFi</div>'; return; }
+    let html='';
+    for(let a of list){
+      if(!a.ssid) continue;
+      let pad = a.rssi>=-65?'#2ecc71':(a.rssi>=-80?'#f39c12':'#e94560');
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 4px;border-bottom:1px solid #1a2a4a;font-size:13px" onclick="pickWifi(\''+a.ssid.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">'+
+              '<span>'+a.ssid+'</span><span style="color:'+pad+'">'+a.rssi+'dBm</span></div>';
+    }
+    $('wifiList').innerHTML = html;
+    setStatus('点击列表选择 WiFi','#4ecca3');
+  }catch(e){ setStatus('扫描结果解析失败','#e94560'); }
+}
+function pickWifi(ssid){ $('wSsid').value = ssid; $('wPass').focus(); }
+async function saveWifi(){
+  let btn = document.querySelector('#wifiForm button[onclick="saveWifi()"]');
+  let ssid = $('wSsid').value.trim();
+  let pass = $('wPass').value.trim();
+  if(!ssid){ setStatus('请输入 SSID','#e94560'); $('wSsid').focus(); return; }
+  if(btn) btn.disabled = true;
+  setStatus('正在保存并连接 '+ssid+'...','#4ecca3');
+  let r = await api('/api/wifi/configure', {ssid:ssid, password:pass});
+  setStatus('已保存！正在连接新网络，热点稍后自动关闭...', '#4ecca3');
+  if(btn) btn.disabled = false;
+}
+
+(async function(){
+  await updateWifiInfo();
+})();
+
 // --- Battery ---
 async function updateBattery(){
   let r = await api('/api/battery');
@@ -458,6 +551,84 @@ static esp_err_t HandleBattery(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t HandleWifiStatus(httpd_req_t *req)
+{
+    char buf[160];
+    const char *ssid = "unknown";
+    {
+        char s[33] = {}, p[65] = {};
+        if (WifiConfigGetCredentials(s, sizeof(s), p, sizeof(p)) && s[0]) ssid = "saved";
+#ifdef WIFI_STA_SSID
+        else ssid = WIFI_STA_SSID;
+#else
+        else ssid = "none";
+#endif
+    }
+    bool online = (strcmp(WiFiIP(), "0.0.0.0") != 0);
+    snprintf(buf, sizeof(buf),
+             "{\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"portal\":%s}",
+             online ? "true" : "false", ssid, WiFiIP(),
+             WifiConfigPortalRunning() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiPortal(httpd_req_t *req)
+{
+    httpd_req_recv(req, nullptr, 0); /* discard body */
+    WifiConfigEnterFromWeb();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "portal started");
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiScan(httpd_req_t *req)
+{
+    char buf[1200];
+    WifiConfigScanAps(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiConfigure(httpd_req_t *req)
+{
+    char body[512] = {};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+    body[len] = 0;
+
+    char ssid[33] = {}, pass[65] = {};
+    const char *ps = strstr(body, "\"ssid\"");
+    const char *pp = strstr(body, "\"password\"");
+    if (ps) {
+        ps = strchr(ps, ':'); ps = strchr(ps, '"');
+        const char *e = strchr(ps + 1, '"');
+        size_t n = (e && e > ps) ? (size_t)(e - ps - 1) : 0;
+        if (n >= sizeof(ssid)) n = sizeof(ssid) - 1;
+        memcpy(ssid, ps + 1, n);
+    }
+    if (pp) {
+        pp = strchr(pp, ':'); pp = strchr(pp, '"');
+        const char *e = strchr(pp + 1, '"');
+        size_t n = (e && e > pp) ? (size_t)(e - pp - 1) : 0;
+        if (n >= sizeof(pass)) n = sizeof(pass) - 1;
+        memcpy(pass, pp + 1, n);
+    }
+    if (!ssid[0]) { httpd_resp_set_type(req, "text/plain"); httpd_resp_sendstr(req, "no ssid"); return ESP_OK; }
+
+    WifiConfigSaveCredentials(ssid, pass);
+
+    /* 先回响应, 让手机收到"已保存"再关热点, 避免页面加载中断乱跳 */
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "ok");
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    WifiConfigStopPortal();  /* 保存后切回 STA 连接 */
+    return ESP_OK;
+}
+
 // ==================== Server startup ====================
 
 void StartHttpServer()
@@ -477,6 +648,24 @@ void StartHttpServer()
 
     httpd_uri_t battery = {.uri = "/api/battery", .method = HTTP_GET, .handler = HandleBattery, .user_ctx = nullptr};
     httpd_register_uri_handler(server, &battery);
+
+    httpd_uri_t wifi_status = {.uri = "/api/wifi", .method = HTTP_GET, .handler = HandleWifiStatus, .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &wifi_status);
+    httpd_uri_t wifi_portal = {.uri = "/api/wifi/portal", .method = HTTP_POST, .handler = HandleWifiPortal, .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &wifi_portal);
+    httpd_uri_t wifi_scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = HandleWifiScan, .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &wifi_scan);
+    httpd_uri_t wifi_cfg = {.uri = "/api/wifi/configure", .method = HTTP_POST, .handler = HandleWifiConfigure, .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &wifi_cfg);
+
+    /* 全局 404 → 重定向到首页: 配合 DNS 劫持实现 captive portal,
+     * 手机连上 Panda-XXXX 后系统探测任何 URL 都会落到首页, 触发"登录网络"弹窗 */
+    httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, [](httpd_req_t *req, httpd_err_code_t err) -> esp_err_t {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_sendstr(req, "<html><body>redirecting...</body></html>");
+        return ESP_OK;
+    });
 
 #if ENABLE_AUTO_RUN
     httpd_uri_t autoplay_get  = {.uri = "/api/autoplay", .method = HTTP_GET,  .handler = HandleAutoPlay, .user_ctx = nullptr};

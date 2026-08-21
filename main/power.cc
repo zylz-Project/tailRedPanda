@@ -1,5 +1,6 @@
 #include "power.h"
 #include "config.h"
+#include "chat.h"
 
 #include <driver/gpio.h>
 #include <esp_adc/adc_cali.h>
@@ -104,6 +105,8 @@ void InitPower()
 
         // Edge detection
         static int prev_stable = 1;
+        static uint32_t last_click_tick = 0;
+        static uint32_t click_count = 0;
         if (pwr_stable != prev_stable) {
             if (!pwr_stable) {
                 ESP_LOGI(TAG, "Power button PRESSED");
@@ -115,6 +118,20 @@ void InitPower()
                     ESP_LOGW(TAG, "Long press %dms -> SHUTDOWN (IO%d -> LOW)",
                              POWER_LONG_PRESS_MS, POWER_CTRL_GPIO);
                     gpio_set_level(POWER_CTRL_GPIO, 0);
+                } else {
+                    // Short press -> double-click detection (toggles LLM chat)
+                    uint32_t now = xTaskGetTickCount();
+                    if (now - last_click_tick <= pdMS_TO_TICKS(400)) {
+                        click_count++;
+                    } else {
+                        click_count = 1;
+                    }
+                    last_click_tick = now;
+                    if (click_count >= 2) {
+                        click_count = 0;
+                        ESP_LOGI(TAG, "DOUBLE CLICK -> toggle chat");
+                        ChatToggle();
+                    }
                 }
             }
             prev_stable = pwr_stable;

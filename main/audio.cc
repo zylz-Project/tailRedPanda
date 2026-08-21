@@ -28,8 +28,11 @@ static const char *TAG = "panda_audio";
 static esp_codec_dev_handle_t dev_ = nullptr;
 static i2c_master_bus_handle_t i2c_bus_ = nullptr;
 static i2s_chan_handle_t tx_chan_ = nullptr;
+static i2s_chan_handle_t rx_chan_ = nullptr;
 static QueueHandle_t sound_queue_ = nullptr;
+static SemaphoreHandle_t audio_mutex_ = nullptr;
 static volatile bool is_playing_ = false;
+static volatile bool stop_playback_ = false;   // set to interrupt current sound
 static volatile float motion_level_ = 0.0f;
 static volatile float motion_attack_ = 0.0f;
 static volatile uint32_t motion_elapsed_ms_ = 0;
@@ -44,6 +47,8 @@ static void AudioPlayTask(void *arg) {
   int type;
   while (true) {
     if (xQueueReceive(sound_queue_, &type, portMAX_DELAY) != pdTRUE) continue;
+
+    stop_playback_ = false;  // new sound: clear interrupt flag
 
     // enum value = TOC index (files sorted alphabetically in build script)
     int idx = type;
@@ -110,32 +115,37 @@ static void AudioPlayTask(void *arg) {
         return;
       }
 
-      // Output to I2S
-      size_t sn = out.decoded_size / sizeof(int16_t);
-      for (size_t off = 0; off < sn; off += I2S_CHUNK_SAMPLES) {
-        size_t chunk_n = sn - off;
-        if (chunk_n > I2S_CHUNK_SAMPLES) chunk_n = I2S_CHUNK_SAMPLES;
+        // Output to I2S (serialized against chat playback via audio_mutex_)
+        size_t sn = out.decoded_size / sizeof(int16_t);
+        for (size_t off = 0; off < sn; off += I2S_CHUNK_SAMPLES) {
+          size_t chunk_n = sn - off;
+          if (chunk_n > I2S_CHUNK_SAMPLES) chunk_n = I2S_CHUNK_SAMPLES;
 
-        // A dual-time-constant envelope gives animation useful information
-        // without making the servos chase individual PCM samples.
-        const int16_t *samples = ((int16_t *)pcm) + off;
-        uint32_t absolute_sum = 0;
-        for (size_t i = 0; i < chunk_n; ++i)
-          absolute_sum += (uint32_t)std::abs((int)samples[i]);
-        float raw = chunk_n ? (float)absolute_sum / (float)chunk_n / 9000.0f : 0.0f;
-        if (raw > 1.0f) raw = 1.0f;
-        fast_envelope_ += (raw - fast_envelope_) * (raw > fast_envelope_ ? 0.48f : 0.12f);
-        slow_envelope_ += (raw - slow_envelope_) * 0.035f;
-        float onset = (fast_envelope_ - slow_envelope_ * 1.08f) * 3.2f;
-        if (onset < 0.0f) onset = 0.0f;
-        if (onset > 1.0f) onset = 1.0f;
-        motion_level_ = slow_envelope_;
-        motion_attack_ = onset;
-        motion_elapsed_ms_ += (uint32_t)(chunk_n * 1000U / 48000U);
+          // A dual-time-constant envelope gives animation useful information
+          // without making the servos chase individual PCM samples.
+          const int16_t *samples = ((int16_t *)pcm) + off;
+          uint32_t absolute_sum = 0;
+          for (size_t i = 0; i < chunk_n; ++i)
+            absolute_sum += (uint32_t)std::abs((int)samples[i]);
+          float raw = chunk_n ? (float)absolute_sum / (float)chunk_n / 9000.0f : 0.0f;
+          if (raw > 1.0f) raw = 1.0f;
+          fast_envelope_ += (raw - fast_envelope_) * (raw > fast_envelope_ ? 0.48f : 0.12f);
+          slow_envelope_ += (raw - slow_envelope_) * 0.035f;
+          float onset = (fast_envelope_ - slow_envelope_ * 1.08f) * 3.2f;
+          if (onset < 0.0f) onset = 0.0f;
+          if (onset > 1.0f) onset = 1.0f;
+          motion_level_ = slow_envelope_;
+          motion_attack_ = onset;
+          motion_elapsed_ms_ += (uint32_t)(chunk_n * 1000U / 48000U);
 
-        esp_codec_dev_write(dev_, ((int16_t *)pcm) + off, chunk_n * sizeof(int16_t));
-        vTaskDelay(pdMS_TO_TICKS(3));
-      }
+          if (stop_playback_) break;
+
+          if (audio_mutex_ && xSemaphoreTake(audio_mutex_, portMAX_DELAY) != pdTRUE)
+            continue;
+          esp_codec_dev_write(dev_, ((int16_t *)pcm) + off, chunk_n * sizeof(int16_t));
+          if (audio_mutex_) xSemaphoreGive(audio_mutex_);
+          vTaskDelay(pdMS_TO_TICKS(3));
+        }
     });
 
     printf("I (%lu) %s: Playing #%d: %s (%lu bytes)\n",
@@ -146,7 +156,7 @@ static void AudioPlayTask(void *arg) {
     // Stream file from SPI Flash in 4KB chunks
     uint8_t chunk[4096];
     uint32_t f_off = 0;
-    while (f_off < info.size && !dec_fail) {
+    while (f_off < info.size && !dec_fail && !stop_playback_) {
       size_t n = info.size - f_off;
       if (n > sizeof(chunk)) n = sizeof(chunk);
       if (flash_audio_read_file(idx, f_off, chunk, n) != ESP_OK) {
@@ -186,7 +196,7 @@ void InitAudio()
 
   i2s_chan_config_t ch = {}; ch.id = I2S_NUM_0; ch.role = I2S_ROLE_MASTER;
   ch.dma_desc_num = 6; ch.dma_frame_num = 240; ch.auto_clear_after_cb = true;
-  if (i2s_new_channel(&ch, &tx_chan_, nullptr) != ESP_OK) return;
+  if (i2s_new_channel(&ch, &tx_chan_, &rx_chan_) != ESP_OK) return;
 
   i2s_std_config_t st = {};
   st.clk_cfg.sample_rate_hz = 48000; st.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
@@ -197,29 +207,83 @@ void InitAudio()
   st.gpio_cfg.ws = AUDIO_I2S_GPIO_WS; st.gpio_cfg.dout = AUDIO_I2S_GPIO_DOUT;
   st.gpio_cfg.din = AUDIO_I2S_GPIO_DIN;
   if (i2s_channel_init_std_mode(tx_chan_, &st) != ESP_OK) return;
+  if (i2s_channel_init_std_mode(rx_chan_, &st) != ESP_OK) return;
   if (i2s_channel_enable(tx_chan_) != ESP_OK) return;
+  if (i2s_channel_enable(rx_chan_) != ESP_OK) return;
 
-  audio_codec_i2s_cfg_t is = {.port = I2S_NUM_0, .tx_handle = tx_chan_};
+  audio_codec_i2s_cfg_t is = {.port = I2S_NUM_0, .rx_handle = rx_chan_, .tx_handle = tx_chan_, .clk_src = 0};
   auto *d = audio_codec_new_i2s_data(&is);
   audio_codec_i2c_cfg_t icc = {.port = I2C_NUM_0, .addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = i2c_bus_};
   auto *c = audio_codec_new_i2c_ctrl(&icc);
   auto *g = audio_codec_new_gpio();
 
   es8311_codec_cfg_t es = {};
-  es.ctrl_if = c; es.gpio_if = g; es.codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC;
+  es.ctrl_if = c; es.gpio_if = g; es.codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH;
   es.pa_pin = GPIO_NUM_NC; es.use_mclk = false;
   es.hw_gain.pa_voltage = 5.0f; es.hw_gain.codec_dac_voltage = 3.3f; es.no_dac_ref = true;
 
-  esp_codec_dev_cfg_t dc = {.dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = es8311_codec_new(&es), .data_if = d};
+  esp_codec_dev_cfg_t dc = {.dev_type = ESP_CODEC_DEV_TYPE_IN_OUT, .codec_if = es8311_codec_new(&es), .data_if = d};
   dev_ = esp_codec_dev_new(&dc);
-  esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 1, .sample_rate = 48000, .mclk_multiple = I2S_MCLK_MULTIPLE_256};
+  esp_codec_dev_sample_info_t fs = {.bits_per_sample = 16, .channel = 1, .channel_mask = 0, .sample_rate = 48000, .mclk_multiple = I2S_MCLK_MULTIPLE_256};
   esp_codec_dev_open(dev_, &fs);
+  esp_codec_dev_set_in_gain(dev_, 42);  // ES8311 麦克风增益最大档 42dB
   esp_codec_dev_set_out_vol(dev_, AUDIO_OUTPUT_VOLUME);
 
-  ESP_LOGI(TAG, "Ready: ES8311 48kHz vol %d%%", AUDIO_OUTPUT_VOLUME);
+  audio_mutex_ = xSemaphoreCreateMutex();
+
+  ESP_LOGI(TAG, "Ready: ES8311 48kHz duplex (mic+spk), vol %d%%", AUDIO_OUTPUT_VOLUME);
 
   sound_queue_ = xQueueCreate(8, sizeof(int));
   xTaskCreatePinnedToCore(AudioPlayTask, "panda_play", 32768, nullptr, 3, nullptr, 1);
+}
+
+int AudioReadMic48k(int16_t *buf, int samples) {
+  if (!dev_ || !buf || samples <= 0) return 0;
+  if (audio_mutex_ && xSemaphoreTake(audio_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) return 0;
+  int ret = esp_codec_dev_read(dev_, buf, samples * (int)sizeof(int16_t));
+  if (audio_mutex_) xSemaphoreGive(audio_mutex_);
+  return ret == ESP_CODEC_DEV_OK ? samples * (int)sizeof(int16_t) : 0;
+}
+
+void AudioWritePcm48k(const int16_t *pcm, int samples) {
+  if (!dev_ || !pcm || samples <= 0) return;
+  // Chat is half-duplex: while TTS is playing the mic task is paused.  Never
+  // discard a TTS block merely because the final in-flight mic read still owns
+  // the codec briefly; a dropped block is heard as a click or short gap.
+  if (audio_mutex_ && xSemaphoreTake(audio_mutex_, portMAX_DELAY) != pdTRUE) return;
+  esp_codec_dev_write(dev_, (void *)pcm, samples * (int)sizeof(int16_t));
+  if (audio_mutex_) xSemaphoreGive(audio_mutex_);
+}
+
+void AudioPlayChatReadyTone() {
+  static constexpr float kPi = 3.14159265358979323846f;
+  static constexpr int kSampleRate = 48000;
+  static constexpr int kChunkSamples = 240;
+  const int tones[] = {880, 1100};
+  const int durations_ms[] = {80, 120};
+  int16_t chunk[kChunkSamples];
+
+  // Match the reference project's short ascending "ready" sound.  Generate it
+  // in small blocks so the prompt needs no flash access or large allocation.
+  for (int t = 0; t < 2; ++t) {
+    const int total = kSampleRate * durations_ms[t] / 1000;
+    const int fade = total / 8;
+    for (int pos = 0; pos < total; pos += kChunkSamples) {
+      int count = total - pos;
+      if (count > kChunkSamples) count = kChunkSamples;
+      for (int i = 0; i < count; ++i) {
+        const int sample = pos + i;
+        float gain = 1.0f;
+        if (sample < fade) gain = (float)sample / (float)fade;
+        else if (sample >= total - fade)
+          gain = (float)(total - sample - 1) / (float)fade;
+        chunk[i] = (int16_t)(sinf(2.0f * kPi * tones[t] * sample /
+                                  (float)kSampleRate) * 8000.0f * gain);
+      }
+      AudioWritePcm48k(chunk, count);
+    }
+    if (t == 0) vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 bool PlayPandaSound(int t) {
@@ -240,4 +304,41 @@ AudioMotionData GetAudioMotionData() {
 void FlushAudioQueue() {
   if (!sound_queue_) return;
   int dummy; while (xQueueReceive(sound_queue_, &dummy, 0) == pdTRUE) {}
+}
+
+void AudioStopCurrent() {
+  stop_playback_ = true;
+}
+
+// 合成提示音（不上 flash，直接生成正弦波 + 包络）
+static void ChimeTone(float freq, int dur_ms, float vol) {
+  const int sr = AUDIO_SAMPLE_RATE;
+  const int chunk = 240;
+  const int total = sr * dur_ms / 1000;
+  int16_t buf[chunk];
+  for (int pos = 0; pos < total; pos += chunk) {
+    int n = total - pos;
+    if (n > chunk) n = chunk;
+    for (int i = 0; i < n; i++) {
+      float pi = (float)(pos + i);
+      float t = pi / (float)sr;
+      float attack = pi < sr * 0.010f ? pi / (sr * 0.010f) : 1.0f;
+      float rb = (float)total - sr * 0.040f;
+      float release = pi > rb ? (1.0f - (pi - rb) / (sr * 0.040f)) : 1.0f;
+      if (release < 0.0f) release = 0.0f;
+      float v = vol * attack * release * std::sin(2.0f * (float)M_PI * freq * t);
+      buf[i] = (int16_t)(v * 32767.0f);
+    }
+    AudioWritePcm48k(buf, n);
+  }
+}
+
+void AudioPlayChime(bool ascending) {
+  if (ascending) {
+    ChimeTone(784.0f, 130, 0.50f);    // G5
+    ChimeTone(1174.66f, 200, 0.45f);  // D6
+  } else {
+    ChimeTone(1174.66f, 130, 0.50f);
+    ChimeTone(784.0f, 200, 0.45f);
+  }
 }
