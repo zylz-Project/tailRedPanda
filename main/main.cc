@@ -35,11 +35,14 @@ extern "C" void app_main()
     // --- WiFi (chat depends on it; 配网: 连不上就进配网热点) ---
     InitWiFi();
     bool has_creds = WifiConfigHasCredentials();
+#ifdef WIFI_STA_SSID
+    if (!has_creds) has_creds = (WIFI_STA_SSID[0] != '\0');  // config.h 默认值也算有凭据
+#endif
     bool online = false;
     if (has_creds) {
         online = WaitForWiFi(WIFI_STA_TIMEOUT_S);
     }
-    // 无已存凭据: 不等 15s, 立刻开热点; 有凭据但连不上(如在外无信号): 超时后也开热点,
+    // 无任何凭据: 不等, 立刻开热点; 有凭据但连不上(如在外无信号): 超时后也开热点,
     // 这样任何情况下都能重新配网。
     if (!online) {
         ESP_LOGI(TAG, "WiFi offline%s — starting config portal",

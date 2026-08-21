@@ -1,7 +1,7 @@
 #pragma once
 
 // === Feature toggles ===
-#define OFFLINE_DEMO 1           // 1 = skip WiFi, boot instantly for offline demo. 0 = normal
+#define OFFLINE_DEMO 0           // 0 = 正常: 联网后从 Audio Hub 同步音频到 Flash; 1 = 跳过WiFi/同步
 #define ENABLE_AUTO_RUN 1        // 1 = compile auto-run feature, 0 = disable entirely
 #define AUTO_RUN_DEFAULT_ON 1    // 1 = active on power-up, 0 = start paused
 #define AUTO_RUN_DEFAULT_HARD 0  // 1 = hard swing (instant to extrema + hold), 0 = sin² smooth
@@ -60,8 +60,8 @@
 
 // === External SPI Flash ===
 // 1 = W25Q256 (NOR), 2 = W25N01GVZEIG (SPI NAND, 128MB)
-// 当前板子接的是 W25Q256 (NOR)
-#define EXTERNAL_FLASH_TYPE 1
+// 当前板子接的是 W25N01GVZEIG (NOR)
+#define EXTERNAL_FLASH_TYPE 2
 #define SPI_FLASH_CS_PIN   GPIO_NUM_10
 #define SPI_FLASH_CLK_PIN  GPIO_NUM_9
 #define SPI_FLASH_MOSI_PIN GPIO_NUM_47
@@ -70,9 +70,9 @@
 // === WiFi Station ===
 // 默认 WiFi 信息已注释, 用于模拟"无 WiFi"场景测试配网热点。
 // 恢复后重新编译即可 (或通过 NVS 配网保存凭据)。
-//#define WIFI_STA_SSID     "huachuang109"
-//#define WIFI_STA_PASSWORD "huachuang109"
-#define WIFI_STA_TIMEOUT_S 8   // 连接超时(秒), 超时后继续运行
+#define WIFI_STA_SSID     "huachuang109"
+#define WIFI_STA_PASSWORD "huachuang109"
+#define WIFI_STA_TIMEOUT_S 10   // 连接超时(秒), 超时后继续运行
 
 // === Audio Sync Server ===
 #define SYNC_SERVER_IP    "192.168.1.7"    // 用户电脑 IP, 按需修改
